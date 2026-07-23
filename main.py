@@ -398,8 +398,6 @@ def main():
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
-        per_chat=True,
     )
     app.add_handler(conv_auth)
 
@@ -409,8 +407,6 @@ def main():
             WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
-        per_chat=True,
     )
     app.add_handler(conv_channel)
 
@@ -420,8 +416,6 @@ def main():
             WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
-        per_chat=True,
     )
     app.add_handler(conv_chat)
 
@@ -431,17 +425,16 @@ def main():
             WAITING_REPLY_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reply_to_support)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True,
-        per_chat=True,
     )
     app.add_handler(conv_reply)
 
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^(support_list|show_settings|close_|back_to_menu)$"))
 
-    # ИСПРАВЛЕНО: filters.Channel → filters.ChatType.CHANNEL
+    # Правильный фильтр для каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
 
-    app.add_handler(MessageHandler(filters.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
+    # Правильный фильтр для личных сообщений
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
     app.add_handler(CommandHandler("start", start))
 
     logger.info("Бот запущен...")
