@@ -1,6 +1,7 @@
 import os
 import logging
 import sqlite3
+import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -143,8 +144,14 @@ def check_credentials(login, password):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для пересылки сообщений из каналов и поддержки пользователей.\n"
-        "Администраторы, авторизуйтесь через /adminkarpl."
+        "Администраторы, авторизуйтесь через /adminkarpl.\n\n"
+        "Команда /getid – получить ID текущего чата (отправьте в том чате)."
     )
+
+async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отвечает ID чата, в котором вызвана команда."""
+    chat = update.effective_chat
+    await update.message.reply_text(f"🆔 ID этого чата: `{chat.id}`", parse_mode="Markdown")
 
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -200,10 +207,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "support_list":
         await show_support_list(query)
     elif data == "add_channel":
-        await query.edit_message_text("Введите @username канала (бот должен быть админом):")
+        await query.edit_message_text(
+            "Введите @username канала (например, @my_channel).\n"
+            "Бот должен быть администратором этого канала."
+        )
         return WAITING_CHANNEL_USERNAME
     elif data == "add_chat":
-        await query.edit_message_text("Введите ссылку или @username чата (бот должен состоять):")
+        await query.edit_message_text(
+            "Введите числовой ID чата (например, -1001234567890) или @username для публичного чата.\n"
+            "Бот должен состоять в этом чате.\n"
+            "Чтобы узнать ID, отправьте /getid в нужном чате."
+        )
         return WAITING_CHAT_LINK
     elif data == "show_settings":
         await show_settings(query)
@@ -270,43 +284,71 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = chat.id
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("❌ Бот не администратор этого канала.")
+            await update.message.reply_text("❌ Бот не является администратором этого канала.")
             return ConversationHandler.END
         add_source_channel(chat_id, username, update.effective_user.id)
-        await update.message.reply_text(f"✅ Канал {username} добавлен.")
+        await update.message.reply_text(f"✅ Канал {username} добавлен как источник.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка при добавлении канала: {e}")
     return ConversationHandler.END
 
 async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = update.message.text.strip()
-    username = None
     chat_id = None
+    username = None
+
+    # Попытка извлечь username из ссылки
+    # Ссылки вида https://t.me/username или t.me/username
     if link.startswith('@'):
         username = link
     elif link.startswith('https://t.me/'):
+        # Пытаемся извлечь username
         parts = link.split('/')
-        username = '@' + parts[-1]
+        if len(parts) >= 4:
+            candidate = parts[-1]
+            # Если это не joinchat и не +
+            if candidate and not candidate.startswith('joinchat') and not candidate.startswith('+'):
+                username = '@' + candidate
+            else:
+                # Это приватная ссылка, не поддерживается
+                await update.message.reply_text(
+                    "❌ Вы отправили приватную ссылку (joinchat или +). "
+                    "Бот не может получить чат по такой ссылке.\n"
+                    "Пожалуйста, сначала добавьте бота в чат, затем используйте /getid в этом чате "
+                    "и введите полученный числовой ID."
+                )
+                return ConversationHandler.END
     else:
+        # Пробуем как числовой ID
         try:
             chat_id = int(link)
-        except:
-            await update.message.reply_text("❌ Неверный формат.")
-            return ConversationHandler.END
+        except ValueError:
+            # Возможно, это username без @
+            if link.startswith('@'):
+                username = link
+            else:
+                username = '@' + link
+
     try:
         if username:
             chat = await context.bot.get_chat(username)
             chat_id = chat.id
-        else:
+        elif chat_id is not None:
             chat = await context.bot.get_chat(chat_id)
+        else:
+            await update.message.reply_text("❌ Не удалось распознать ввод. Введите @username или числовой ID.")
+            return ConversationHandler.END
+
+        # Проверяем, состоит ли бот в чате
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['member', 'administrator', 'creator']:
-            await update.message.reply_text("❌ Бот не состоит в этом чате.")
+            await update.message.reply_text("❌ Бот не состоит в этом чате. Добавьте его и повторите.")
             return ConversationHandler.END
+
         add_target_chat(chat_id, link, update.effective_user.id)
-        await update.message.reply_text(f"✅ Чат {link} добавлен.")
+        await update.message.reply_text(f"✅ Чат {link} добавлен как целевой.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка при добавлении чата: {e}")
     return ConversationHandler.END
 
 async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,13 +471,10 @@ def main():
     app.add_handler(conv_reply)
 
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^(support_list|show_settings|close_|back_to_menu)$"))
-
-    # Правильный фильтр для каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
-
-    # Правильный фильтр для личных сообщений
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("getid", getid))  # новая команда
 
     logger.info("Бот запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
