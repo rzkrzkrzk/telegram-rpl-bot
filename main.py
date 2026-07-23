@@ -1,10 +1,9 @@
 import os
 import logging
 import sqlite3
-import re
 import asyncio
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,10 +24,9 @@ if not TOKEN:
 DB_PATH = "bot_data.db"
 ADMIN_SESSION_MINUTES = 30
 
-# Состояния для диалогов
 WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
 
-# ---------- Инициализация БД ----------
+# ---------- БД ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -136,7 +134,6 @@ def is_admin(user_id):
         if last_activity and (datetime.now().timestamp() - last_activity) < ADMIN_SESSION_MINUTES * 60:
             return True
         else:
-            # Сессия истекла – удаляем запись
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
@@ -168,7 +165,6 @@ def remove_admin(user_id):
     conn.commit()
     conn.close()
 
-# ---------- Проверка логина/пароля ----------
 def check_credentials(login, password):
     credentials = {
         "goyda1488": "goydarpl",
@@ -178,20 +174,18 @@ def check_credentials(login, password):
 
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
-    keyboard = [
+    return ReplyKeyboardMarkup([
         ["Наш Discord", "Наш Сайт"],
         ["Обратиться в поддержку"],
         ["Главное меню"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    ], resize_keyboard=True)
 
 def admin_menu_keyboard():
-    keyboard = [
+    return ReplyKeyboardMarkup([
         ["Добавить каналы", "Добавить чаты"],
         ["Проверить поддержку", "Настройки"],
         ["Выйти"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    ], resize_keyboard=True)
 
 # ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,8 +198,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🏠 **Главное меню**\n"
-        "Выберите действие:",
+        "🏠 **Главное меню**\nВыберите действие:",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
@@ -222,7 +215,7 @@ async def website(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard()
     )
 
-# Поддержка – начало диалога
+# Поддержка
 async def support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✍️ Напишите ваше сообщение для поддержки.\n"
@@ -240,7 +233,6 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_id = add_support_message(user.id, user.username or str(user.id), text)
 
-    # Уведомляем всех админов
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('SELECT user_id FROM admins')
@@ -262,22 +254,21 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Не удалось отправить админу {admin_id}: {e}")
     else:
-        await update.message.reply_text("⚠️ В данный момент нет активных администраторов. Ваше сообщение сохранено, они получат его при входе.")
+        await update.message.reply_text("⚠️ Нет активных администраторов. Сообщение сохранено.")
 
-    await update.message.reply_text("✅ Сообщение отправлено в поддержку. Ожидайте ответа.")
-    # Возвращаем в главное меню
+    await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
     await main_menu(update, context)
     return ConversationHandler.END
 
 async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Отправка обращения отменена.")
+    await update.message.reply_text("❌ Отправка отменена.")
     await main_menu(update, context)
     return ConversationHandler.END
 
-# ---------- Админ-панель ----------
+# ---------- Админ ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        await update.message.reply_text("Эта команда доступна только в личных сообщениях.")
+        await update.message.reply_text("Команда только в личных сообщениях.")
         return ConversationHandler.END
     await update.message.reply_text("🔑 Введите логин:")
     return WAITING_LOGIN
@@ -292,17 +283,17 @@ async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text
     if check_credentials(login, password):
         add_admin(update.effective_user.id)
-        await update.message.reply_text("✅ Вы авторизованы как администратор!", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
     else:
         await update.message.reply_text("❌ Неверный логин или пароль. Попробуйте /adminkarpl")
         return ConversationHandler.END
 
-# Обработчик кнопок админ-меню (ReplyKeyboard)
+# Обработчик кнопок админ-меню
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ У вас нет активной сессии. Авторизуйтесь через /adminkarpl.")
+        await update.message.reply_text("⛔ Сессия истекла. Авторизуйтесь через /adminkarpl.")
         await main_menu(update, context)
         return
 
@@ -312,9 +303,9 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_CHANNEL_USERNAME
     elif text == "Добавить чаты":
         await update.message.reply_text(
-            "Введите числовой ID чата (например, -1001234567890) или @username для публичного чата.\n"
-            "Бот должен состоять в этом чате.\n"
-            "Чтобы узнать ID, отправьте /getid в нужном чате."
+            "Введите числовой ID чата или @username.\n"
+            "Бот должен состоять в чате.\n"
+            "Узнать ID можно через /getid в нужном чате."
         )
         return WAITING_CHAT_LINK
     elif text == "Проверить поддержку":
@@ -328,7 +319,6 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
         return
     else:
-        # Если админ написал что-то другое – просто игнорируем или показываем меню
         await update.message.reply_text("Используйте кнопки меню.", reply_markup=admin_menu_keyboard())
         return
     return ConversationHandler.END
@@ -342,10 +332,10 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = chat.id
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("❌ Бот не является администратором этого канала.")
+            await update.message.reply_text("❌ Бот не администратор.")
             return ConversationHandler.END
         add_source_channel(chat_id, username, update.effective_user.id)
-        await update.message.reply_text(f"✅ Канал {username} добавлен как источник.", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"✅ Канал {username} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
@@ -364,9 +354,7 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if candidate and not candidate.startswith('joinchat') and not candidate.startswith('+'):
                 username = '@' + candidate
             else:
-                await update.message.reply_text(
-                    "❌ Приватные ссылки не поддерживаются. Используйте числовой ID."
-                )
+                await update.message.reply_text("❌ Приватная ссылка не поддерживается. Используйте ID.")
                 return ConversationHandler.END
     else:
         try:
@@ -381,16 +369,16 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif chat_id is not None:
             chat = await context.bot.get_chat(chat_id)
         else:
-            await update.message.reply_text("❌ Не удалось распознать ввод.")
+            await update.message.reply_text("❌ Неверный формат.")
             return ConversationHandler.END
 
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['member', 'administrator', 'creator']:
-            await update.message.reply_text("❌ Бот не состоит в этом чате.")
+            await update.message.reply_text("❌ Бот не состоит в чате.")
             return ConversationHandler.END
 
         add_target_chat(chat_id, link, update.effective_user.id)
-        await update.message.reply_text(f"✅ Чат {link} добавлен как целевой.", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text(f"✅ Чат {link} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
     return ConversationHandler.END
@@ -400,7 +388,6 @@ async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TY
     if not messages:
         await update.message.reply_text("📭 Новых обращений нет.", reply_markup=admin_menu_keyboard())
         return
-    # Показываем первое
     msg = messages[0]
     msg_id, user_id, username, text, timestamp = msg
     display_text = (
@@ -434,7 +421,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "  (нет)\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
-# ---------- Inline колбэки (для ответа на поддержку) ----------
+# ---------- Инлайн колбэки ----------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -454,14 +441,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = int(data.split("_")[1])
         mark_answered(msg_id)
         await query.edit_message_text("✅ Обращение закрыто.")
-        # Показываем следующее
         messages = get_unanswered_messages()
         if messages:
             await show_support_messages(update, context)
         else:
             await query.message.reply_text("📭 Больше нет обращений.", reply_markup=admin_menu_keyboard())
     elif data == "next_support":
-        # Удаляем текущее сообщение с кнопками и показываем следующее
         await query.message.delete()
         messages = get_unanswered_messages()
         if messages:
@@ -488,7 +473,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-# ---------- Ответ админа на обращение (через текст) ----------
+# ---------- Ответ на обращение ----------
 async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text = update.message.text
     msg_id = context.user_data.get("reply_to")
@@ -498,18 +483,18 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT user_id, username FROM support_messages WHERE id = ?', (msg_id,))
+    c.execute('SELECT user_id FROM support_messages WHERE id = ?', (msg_id,))
     row = c.fetchone()
     conn.close()
     if not row:
         await update.message.reply_text("❌ Обращение не найдено.")
         return ConversationHandler.END
 
-    user_id, username = row
+    user_id = row[0]
     try:
         await context.bot.send_message(chat_id=user_id, text=f"📨 Ответ поддержки:\n{reply_text}")
         mark_answered(msg_id)
-        await update.message.reply_text("✅ Ответ отправлен, обращение закрыто.", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text("✅ Ответ отправлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки: {e}")
     return ConversationHandler.END
@@ -526,60 +511,51 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = channel_post.text or channel_post.caption or ""
-    # Проверяем наличие хэштегов
-    required_tags = ["#MatchDay", "#Results", "#rplpuck"]
-    if not any(tag in text for tag in required_tags):
+    if not any(tag in text for tag in ["#MatchDay", "#Results", "#rplpuck"]):
         return
 
     targets = get_target_chats()
     for target_id, _ in targets:
         try:
             await channel_post.copy(chat_id=target_id)
-            logger.info(f"Переслано из {chat_id} в {target_id} (пост с хэштегами)")
+            logger.info(f"Переслано из {chat_id} в {target_id}")
         except Exception as e:
             logger.error(f"Ошибка пересылки в {target_id}: {e}")
 
-# ---------- Обработка обычных сообщений (не команд, не кнопки) ----------
+# ---------- Автоудаление неизвестных сообщений ----------
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Если сообщение не от админа, не в диалоге поддержки и не команда – удаляем
     if update.effective_chat.type != "private":
         return
-    user = update.effective_user
-    # Проверяем, не является ли пользователь админом (админы могут писать команды, но их сообщения не удаляем)
-    # Но админы тоже могут случайно написать, нужно проверить, что они не в диалоге
-    # Мы проверяем, есть ли активный Conversation для этого чата
-    current_handler = context.chat_data.get("conversation_state")
-    if current_handler:
-        # Если диалог активен – не трогаем
+    # Если это команда – не трогаем
+    if update.message.text and update.message.text.startswith('/'):
         return
-
-    # Проверяем, не является ли текст одной из кнопок меню
+    # Если текст совпадает с кнопками – не трогаем
     if update.message.text in ["Наш Discord", "Наш Сайт", "Обратиться в поддержку", "Главное меню",
                                "Добавить каналы", "Добавить чаты", "Проверить поддержку", "Настройки", "Выйти"]:
-        # Они обрабатываются соответствующими обработчиками
+        return
+    # Проверяем, не в диалоге ли мы (если есть состояние в context)
+    if context.user_data.get("conversation_state"):
         return
 
-    # Удаляем сообщение пользователя и отправляем ошибку, затем удаляем оба
-    user_msg = update.message
     try:
+        user_msg = update.message
         error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса. Попробуйте снова.")
-        # Ждём 3 секунды
         await asyncio.sleep(3)
         await user_msg.delete()
         await error_msg.delete()
     except Exception as e:
-        logger.error(f"Ошибка удаления сообщений: {e}")
+        logger.error(f"Ошибка удаления: {e}")
 
 # ---------- Команда /getid ----------
 async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(f"🆔 ID этого чата: `{chat.id}`", parse_mode="Markdown")
 
-# ---------- Главная функция ----------
+# ---------- MAIN ----------
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Диалог авторизации админа
+    # Диалог авторизации
     conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
@@ -591,9 +567,9 @@ def main():
     )
     app.add_handler(conv_auth)
 
-    # Диалог добавления канала (из админ-меню)
+    # Диалог добавления канала (вход – кнопка "Добавить каналы")
     conv_channel = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Добавить каналы$") & filters.PRIVATE, admin_buttons)],
+        entry_points=[MessageHandler(filters.Regex("^Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
             WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)],
         },
@@ -602,9 +578,9 @@ def main():
     )
     app.add_handler(conv_channel)
 
-    # Диалог добавления чата (из админ-меню)
+    # Диалог добавления чата
     conv_chat = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Добавить чаты$") & filters.PRIVATE, admin_buttons)],
+        entry_points=[MessageHandler(filters.Regex("^Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
             WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)],
         },
@@ -624,9 +600,9 @@ def main():
     )
     app.add_handler(conv_reply)
 
-    # Диалог поддержки (из кнопки)
+    # Диалог поддержки
     conv_support = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Обратиться в поддержку$") & filters.PRIVATE, support_start)],
+        entry_points=[MessageHandler(filters.Regex("^Обратиться в поддержку$") & filters.ChatType.PRIVATE, support_start)],
         states={
             WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)],
         },
@@ -635,24 +611,24 @@ def main():
     )
     app.add_handler(conv_support)
 
-    # Обработчики кнопок админ-меню (без диалогов)
-    app.add_handler(MessageHandler(filters.Regex("^Проверить поддержку$") & filters.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^Настройки$") & filters.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^Выйти$") & filters.PRIVATE, admin_buttons))
+    # Обработчики остальных кнопок админ-меню (без диалогов)
+    app.add_handler(MessageHandler(filters.Regex("^Проверить поддержку$") & filters.ChatType.PRIVATE, admin_buttons))
+    app.add_handler(MessageHandler(filters.Regex("^Настройки$") & filters.ChatType.PRIVATE, admin_buttons))
+    app.add_handler(MessageHandler(filters.Regex("^Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
 
     # Обработчики главного меню
-    app.add_handler(MessageHandler(filters.Regex("^Наш Discord$") & filters.PRIVATE, discord))
-    app.add_handler(MessageHandler(filters.Regex("^Наш Сайт$") & filters.PRIVATE, website))
-    app.add_handler(MessageHandler(filters.Regex("^Главное меню$") & filters.PRIVATE, main_menu))
+    app.add_handler(MessageHandler(filters.Regex("^Наш Discord$") & filters.ChatType.PRIVATE, discord))
+    app.add_handler(MessageHandler(filters.Regex("^Наш Сайт$") & filters.ChatType.PRIVATE, website))
+    app.add_handler(MessageHandler(filters.Regex("^Главное меню$") & filters.ChatType.PRIVATE, main_menu))
 
-    # Колбэки админа (закрытие, следующее, назад)
+    # Инлайн колбэки админа
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin)$"))
 
     # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
 
-    # Обработка неизвестных сообщений (автоудаление)
-    app.add_handler(MessageHandler(filters.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
+    # Автоудаление неизвестных сообщений (ставим низкий приоритет)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
     # Команды
     app.add_handler(CommandHandler("start", start))
