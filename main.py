@@ -24,7 +24,6 @@ if not TOKEN:
 DB_PATH = "bot_data.db"
 ADMIN_SESSION_MINUTES = 30
 
-# Состояния для диалогов
 WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
 
 # ---------- БД ----------
@@ -175,18 +174,15 @@ def check_credentials(login, password):
 
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
-    """Нижняя клавиатура – только одна кнопка 'Главное меню'."""
     return ReplyKeyboardMarkup([["🏠 Главное меню"]], resize_keyboard=True)
 
 def admin_menu_keyboard():
-    """Клавиатура для админ-панели."""
     return ReplyKeyboardMarkup([
         ["➕ Добавить каналы", "➕ Добавить чаты"],
         ["📩 Проверить поддержку", "⚙️ Настройки"],
         ["🚪 Выйти"]
     ], resize_keyboard=True)
 
-# ---------- Inline-меню для приветствия ----------
 def welcome_inline_keyboard():
     keyboard = [
         [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
@@ -197,32 +193,29 @@ def welcome_inline_keyboard():
 
 # ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Отправляем приветствие только при первом входе
     await update.message.reply_text(
         "👋 Добро пожаловать в **Russian Puck League**!\n"
         "Выберите действие с помощью кнопок ниже.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
-    # Отправляем сообщение с inline-кнопками
     await update.message.reply_text(
         "📌 Выберите раздел:",
         reply_markup=welcome_inline_keyboard()
     )
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки 'Главное меню' – возвращает приветствие."""
-    await update.message.reply_text(
-        "👋 Добро пожаловать в **Russian Puck League**!\n"
-        "Выберите действие с помощью кнопок ниже.",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
+    """Обработчик кнопки 'Главное меню' – только выбор раздела, без дублирования приветствия."""
+    # Если пользователь находится в админ-панели, возможно, он хочет выйти? Но по логике кнопка "Главное меню" всегда возвращает к основному меню.
+    # Проверим, не является ли пользователь админом – если да, можно предложить выйти, но мы просто показываем главное меню.
+    # Для простоты – всегда показываем главное меню.
     await update.message.reply_text(
         "📌 Выберите раздел:",
         reply_markup=welcome_inline_keyboard()
     )
 
-# ---------- Inline-колбэки для главного меню ----------
+# ---------- Inline-колбэки ----------
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -233,7 +226,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💬 **Discord Server RPL:** https://discord.gg/dgkFMCgDwx",
             parse_mode="Markdown"
         )
-        # Показываем inline-кнопки снова под этим сообщением
         await query.message.reply_text(
             "📌 Выберите другой раздел:",
             reply_markup=welcome_inline_keyboard()
@@ -248,8 +240,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=welcome_inline_keyboard()
         )
     elif data == "support":
-        # Запускаем диалог поддержки
-        context.user_data["in_conversation"] = True  # флаг для отключения автоудаления
+        context.user_data["in_conversation"] = True
         await query.edit_message_text(
             "✍️ Напишите ваше сообщение для поддержки.\n"
             "Мы ответим вам как можно скорее.\n\n"
@@ -258,7 +249,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_SUPPORT_MSG
     return ConversationHandler.END
 
-# ---------- Поддержка (диалог) ----------
+# ---------- Поддержка ----------
 async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
@@ -292,16 +283,21 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Нет активных администраторов. Сообщение сохранено.")
 
     await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
-    # Сбрасываем флаг диалога
     context.user_data["in_conversation"] = False
-    # Возвращаем в главное меню
-    await main_menu(update, context)
+    # Возврат в главное меню (без приветствия)
+    await update.message.reply_text(
+        "📌 Выберите раздел:",
+        reply_markup=welcome_inline_keyboard()
+    )
     return ConversationHandler.END
 
 async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     await update.message.reply_text("❌ Отправка отменена.")
-    await main_menu(update, context)
+    await update.message.reply_text(
+        "📌 Выберите раздел:",
+        reply_markup=welcome_inline_keyboard()
+    )
     return ConversationHandler.END
 
 # ---------- Админ-панель ----------
@@ -309,7 +305,7 @@ async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Команда только в личных сообщениях.")
         return ConversationHandler.END
-    context.user_data["in_conversation"] = True  # флаг для автоудаления
+    context.user_data["in_conversation"] = True
     await update.message.reply_text("🔑 Введите логин:")
     return WAITING_LOGIN
 
@@ -323,7 +319,7 @@ async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text
     if check_credentials(login, password):
         add_admin(update.effective_user.id)
-        context.user_data["in_conversation"] = False  # снимаем флаг
+        context.user_data["in_conversation"] = False
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
     else:
@@ -335,7 +331,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ Сессия истекла. Авторизуйтесь через /adminkarpl.")
-        await main_menu(update, context)
+        await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
 
     text = update.message.text
@@ -360,13 +356,15 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
+        # Показываем главное меню
+        await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
     else:
         await update.message.reply_text("Используйте кнопки меню.", reply_markup=admin_menu_keyboard())
         return
     return ConversationHandler.END
 
-# ---------- Добавление канала (диалог) ----------
+# ---------- Добавление канала ----------
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
     if not username.startswith('@'):
@@ -386,7 +384,7 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
-# ---------- Добавление чата (диалог) ----------
+# ---------- Добавление чата ----------
 async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = update.message.text.strip()
     chat_id = None
@@ -525,7 +523,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🔙 Возврат в админ-панель.", reply_markup=admin_menu_keyboard())
     return ConversationHandler.END
 
-# ---------- Ответ на обращение (из диалога) ----------
+# ---------- Ответ на обращение ----------
 async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text = update.message.text
     msg_id = context.user_data.get("reply_to")
@@ -554,7 +552,7 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
-# ---------- Пересылка из каналов (только с хэштегами) ----------
+# ---------- Пересылка из каналов ----------
 async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_post = update.channel_post
     if not channel_post:
@@ -579,24 +577,16 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---------- Автоудаление неизвестных сообщений ----------
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Игнорируем, если чат не личный
     if update.effective_chat.type != "private":
         return
-
-    # Если сообщение начинается с "/" – пропускаем (это команды)
     if update.message.text and update.message.text.startswith('/'):
         return
-
-    # Если активен диалог – ничего не делаем
     if context.user_data.get("in_conversation", False):
         return
-
-    # Если текст совпадает с кнопками (и главного меню, и админского) – пропускаем
     text = update.message.text
     if text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", "📩 Проверить поддержку", "⚙️ Настройки", "🚪 Выйти"]:
         return
 
-    # Удаляем сообщение пользователя и отправляем ошибку, через 3 секунды удаляем оба
     try:
         user_msg = update.message
         error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса. Попробуйте снова.")
@@ -615,7 +605,6 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Диалог авторизации админа
     conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
@@ -627,7 +616,6 @@ def main():
     )
     app.add_handler(conv_auth)
 
-    # Диалог добавления канала (вход – кнопка админ-меню)
     conv_channel = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -638,7 +626,6 @@ def main():
     )
     app.add_handler(conv_channel)
 
-    # Диалог добавления чата
     conv_chat = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -649,7 +636,6 @@ def main():
     )
     app.add_handler(conv_chat)
 
-    # Диалог ответа на обращение (из callback админа)
     conv_reply = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_callback, pattern="^reply_")],
         states={
@@ -660,7 +646,6 @@ def main():
     )
     app.add_handler(conv_reply)
 
-    # Диалог поддержки (из inline-кнопки)
     conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={
@@ -671,27 +656,17 @@ def main():
     )
     app.add_handler(conv_support)
 
-    # Обработчики остальных кнопок админ-меню (без диалогов)
     app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
-
-    # Обработчик кнопки "Главное меню"
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$") & filters.ChatType.PRIVATE, main_menu))
 
-    # Inline-колбэки для главного меню (кроме support, который уже в диалоге)
     app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
-
-    # Inline-колбэки админа (close, next, back)
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin)$"))
 
-    # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
-
-    # Автоудаление неизвестных сообщений (группа 999 – низкий приоритет)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("getid", getid))
     app.add_handler(CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")))
