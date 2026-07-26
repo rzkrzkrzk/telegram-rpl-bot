@@ -433,6 +433,8 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings(update, context)
         return
     elif text == "🎮 Настройки игры":
+        # Принудительно сбрасываем все состояния
+        context.user_data["in_conversation"] = False
         await show_game_settings(update, context)
         return
     elif text == "🚪 Выйти":
@@ -550,6 +552,14 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
 async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает настройки игры, сбрасывая все диалоги."""
+    # Сбрасываем любые активные состояния
+    context.user_data["in_conversation"] = False
+    if "reply_to" in context.user_data:
+        del context.user_data["reply_to"]
+    if "gif_type" in context.user_data:
+        del context.user_data["gif_type"]
+
     goal_gif = get_config('gif_goal') or 'не установлен'
     save_gif = get_config('gif_save') or 'не установлен'
     text = (
@@ -563,7 +573,12 @@ async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
     ])
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    # Если update - это callback_query, редактируем, иначе отправляем новое сообщение
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await update.callback_query.answer()
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     query = update.callback_query
@@ -595,6 +610,7 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_ty
         key = 'gif_goal' if gif_type == 'goal' else 'gif_save'
         set_config(key, file_id)
         await update.message.reply_text("✅ GIF сохранён!", reply_markup=admin_menu_keyboard())
+        # Показываем настройки игры с обновлёнными данными
         await show_game_settings(update, context)
     else:
         await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
