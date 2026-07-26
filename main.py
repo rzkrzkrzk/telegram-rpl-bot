@@ -2,6 +2,7 @@ import os
 import logging
 import sqlite3
 import asyncio
+import random
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -24,7 +25,13 @@ if not TOKEN:
 DB_PATH = "bot_data.db"
 ADMIN_SESSION_MINUTES = 30
 
+# Состояния для диалогов
 WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
+# Состояния для игры
+WAITING_DUEL_SHOT = 10
+# Состояния для настройки GIF
+WAITING_GIF_GOAL = 11
+WAITING_GIF_SAVE = 12
 
 # ---------- БД ----------
 def init_db():
@@ -62,12 +69,37 @@ def init_db():
             last_activity INTEGER
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bot_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Инициализация дефолтных GIF (можно потом переопределить через админку)
+    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_goal', ''))
+    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_save', ''))
     conn.commit()
     conn.close()
 
 init_db()
 
 # ---------- Функции БД ----------
+def get_config(key):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT value FROM bot_config WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else ''
+
+def set_config(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO bot_config (key, value) VALUES (?, ?)', (key, value))
+    conn.commit()
+    conn.close()
+
+# Остальные функции БД (без изменений)...
 def add_source_channel(chat_id, username, added_by):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -180,20 +212,29 @@ def admin_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Добавить каналы", "➕ Добавить чаты"],
         ["📩 Проверить поддержку", "⚙️ Настройки"],
-        ["🚪 Выйти"]
+        ["🎮 Настройки игры", "🚪 Выйти"]
     ], resize_keyboard=True)
 
 def welcome_inline_keyboard():
     keyboard = [
         [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
         [InlineKeyboardButton("🌐 Наш Сайт", callback_data="website")],
-        [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")]
+        [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")],
+        [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def duel_shot_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🥅 Левая девятка", callback_data="shot_left")],
+        [InlineKeyboardButton("🥅 Правая девятка", callback_data="shot_right")],
+        [InlineKeyboardButton("🧤 Домик (между щитков)", callback_data="shot_five")],
+        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 # ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Отправляем приветствие только при первом входе
     await update.message.reply_text(
         "👋 Добро пожаловать в **Russian Puck League**!\n"
         "Выберите действие с помощью кнопок ниже.",
@@ -206,10 +247,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки 'Главное меню' – только выбор раздела, без дублирования приветствия."""
-    # Если пользователь находится в админ-панели, возможно, он хочет выйти? Но по логике кнопка "Главное меню" всегда возвращает к основному меню.
-    # Проверим, не является ли пользователь админом – если да, можно предложить выйти, но мы просто показываем главное меню.
-    # Для простоты – всегда показываем главное меню.
     await update.message.reply_text(
         "📌 Выберите раздел:",
         reply_markup=welcome_inline_keyboard()
@@ -247,9 +284,72 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Для отмены отправьте /cancel"
         )
         return WAITING_SUPPORT_MSG
+    elif data == "duel":
+        # Запуск игры
+        context.user_data["in_conversation"] = True
+        await query.edit_message_text(
+            "🏒 **Дуэль Буллитов!**\n"
+            "Выбери зону для броска:",
+            parse_mode="Markdown",
+            reply_markup=duel_shot_keyboard()
+        )
+        return WAITING_DUEL_SHOT
     return ConversationHandler.END
 
-# ---------- Поддержка ----------
+# ---------- Игра "Дуэль Буллитов" ----------
+async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    shot_zone = query.data  # shot_left, shot_right, shot_five, shot_low
+
+    # Зоны вратаря (для простоты используем те же названия)
+    goalie_zones = ["shot_left", "shot_right", "shot_five", "shot_low"]
+    goalie_choice = random.choice(goalie_zones)
+
+    # Определяем результат: гол с шансом 35%
+    scored = random.random() < 0.35
+
+    # Если вратарь выбрал ту же зону, что и игрок – сейф (если не гол)
+    # Но по логике: если зоны совпадают, то гол невозможен? Обычно вратарь закрывает эту зону.
+    # Для простоты: если зоны совпадают, то сейв.
+    if shot_zone == goalie_choice:
+        scored = False
+
+    # Получаем GIF из БД
+    if scored:
+        gif = get_config('gif_goal')
+        result_text = "⚡ **ГОЛ!** Вы точно попали в девятку!"
+        if not gif:
+            gif = "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"  # запасной
+    else:
+        gif = get_config('gif_save')
+        result_text = "🧤 **СЕЙВ!** Вратарь отразил бросок!"
+        if not gif:
+            gif = "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"  # запасной
+
+    # Отправляем результат
+    await query.edit_message_text(
+        f"{result_text}\n\n"
+        f"Ваш бросок: **{shot_zone.replace('shot_', '').capitalize()}**\n"
+        f"Вратарь выбрал: **{goalie_choice.replace('shot_', '').capitalize()}**",
+        parse_mode="Markdown"
+    )
+    # Отправляем GIF
+    try:
+        await query.message.reply_animation(gif)
+    except Exception as e:
+        await query.message.reply_text("❌ Не удалось отправить GIF. Проверьте настройки.")
+        logger.error(f"Ошибка отправки GIF: {e}")
+
+    # Возврат в главное меню
+    await query.message.reply_text(
+        "📌 Выберите другой раздел:",
+        reply_markup=welcome_inline_keyboard()
+    )
+    context.user_data["in_conversation"] = False
+    return ConversationHandler.END
+
+# ---------- Поддержка (без изменений) ----------
 async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
@@ -284,7 +384,6 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
     context.user_data["in_conversation"] = False
-    # Возврат в главное меню (без приветствия)
     await update.message.reply_text(
         "📌 Выберите раздел:",
         reply_markup=welcome_inline_keyboard()
@@ -334,6 +433,9 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
 
+    # Обновляем активность
+    update_admin_activity(user_id)
+
     text = update.message.text
     if text == "➕ Добавить каналы":
         context.user_data["in_conversation"] = True
@@ -353,10 +455,12 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Настройки":
         await show_settings(update, context)
         return
+    elif text == "🎮 Настройки игры":
+        await show_game_settings(update, context)
+        return
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
-        # Показываем главное меню
         await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
         return
     else:
@@ -364,7 +468,62 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     return ConversationHandler.END
 
-# ---------- Добавление канала ----------
+# ---------- Настройки игры ----------
+async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    goal_gif = get_config('gif_goal') or 'не установлен'
+    save_gif = get_config('gif_save') or 'не установлен'
+    text = (
+        "🎮 **Настройки игры «Дуэль Буллитов»**\n\n"
+        f"⚡ **GIF гола:** {goal_gif}\n"
+        f"🧤 **GIF сейва:** {save_gif}\n\n"
+        "Выберите действие:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Изменить GIF гола", callback_data="change_goal_gif")],
+        [InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["gif_type"] = gif_type  # 'goal' или 'save'
+    context.user_data["in_conversation"] = True
+    await query.edit_message_text(
+        f"📤 Отправьте **GIF-файл** для {'гола' if gif_type == 'goal' else 'сейва'}.\n"
+        "Просто перешлите GIF или загрузите файл.\n"
+        "Для отмены отправьте /cancel"
+    )
+    if gif_type == 'goal':
+        return WAITING_GIF_GOAL
+    else:
+        return WAITING_GIF_SAVE
+
+# Обработчик получения GIF
+async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
+    message = update.message
+    file_id = None
+    if message.animation:
+        file_id = message.animation.file_id
+    elif message.document and message.document.mime_type and 'gif' in message.document.mime_type:
+        file_id = message.document.file_id
+    else:
+        await update.message.reply_text("❌ Пожалуйста, отправьте GIF-файл (анимацию или документ).")
+        return
+
+    if file_id:
+        key = 'gif_goal' if gif_type == 'goal' else 'gif_save'
+        set_config(key, file_id)
+        await update.message.reply_text("✅ GIF сохранён!", reply_markup=admin_menu_keyboard())
+        # Возврат в настройки игры
+        await show_game_settings(update, context)
+    else:
+        await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
+    context.user_data["in_conversation"] = False
+    return ConversationHandler.END
+
+# ---------- Добавление канала / чата (без изменений) ----------
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.strip()
     if not username.startswith('@'):
@@ -384,7 +543,6 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["in_conversation"] = False
     return ConversationHandler.END
 
-# ---------- Добавление чата ----------
 async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = update.message.text.strip()
     chat_id = None
@@ -482,6 +640,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔ Сессия истекла. Авторизуйтесь заново.")
         return
 
+    # Обновляем активность
+    update_admin_activity(user_id)
+
     if data.startswith("reply_"):
         msg_id = int(data.split("_")[1])
         context.user_data["reply_to"] = msg_id
@@ -521,6 +682,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_to_admin":
         await query.message.delete()
         await query.message.reply_text("🔙 Возврат в админ-панель.", reply_markup=admin_menu_keyboard())
+    elif data == "change_goal_gif":
+        return await change_gif_start(update, context, 'goal')
+    elif data == "change_save_gif":
+        return await change_gif_start(update, context, 'save')
     return ConversationHandler.END
 
 # ---------- Ответ на обращение ----------
@@ -584,7 +749,7 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get("in_conversation", False):
         return
     text = update.message.text
-    if text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", "📩 Проверить поддержку", "⚙️ Настройки", "🚪 Выйти"]:
+    if text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", "📩 Проверить поддержку", "⚙️ Настройки", "🎮 Настройки игры", "🚪 Выйти"]:
         return
 
     try:
@@ -605,6 +770,7 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # Диалог авторизации
     conv_auth = ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
@@ -616,6 +782,7 @@ def main():
     )
     app.add_handler(conv_auth)
 
+    # Диалог добавления канала
     conv_channel = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить каналы$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -626,6 +793,7 @@ def main():
     )
     app.add_handler(conv_channel)
 
+    # Диалог добавления чата
     conv_chat = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить чаты$") & filters.ChatType.PRIVATE, admin_buttons)],
         states={
@@ -636,6 +804,7 @@ def main():
     )
     app.add_handler(conv_chat)
 
+    # Диалог ответа на обращение
     conv_reply = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_callback, pattern="^reply_")],
         states={
@@ -646,6 +815,7 @@ def main():
     )
     app.add_handler(conv_reply)
 
+    # Диалог поддержки
     conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={
@@ -656,17 +826,58 @@ def main():
     )
     app.add_handler(conv_support)
 
+    # Диалог игры
+    conv_duel = ConversationHandler(
+        entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
+        states={
+            WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Игра отменена."))],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_duel)
+
+    # Диалоги для изменения GIF
+    conv_gif_goal = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_goal_gif$")],
+        states={
+            WAITING_GIF_GOAL: [MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'goal'))],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_gif_goal)
+
+    conv_gif_save = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_save_gif$")],
+        states={
+            WAITING_GIF_SAVE: [MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'save'))],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_gif_save)
+
+    # Обработчики кнопок админ-меню
     app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$") & filters.ChatType.PRIVATE, admin_buttons))
+    app.add_handler(MessageHandler(filters.Regex("^🎮 Настройки игры$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$") & filters.ChatType.PRIVATE, main_menu))
 
+    # Inline-колбэки главного меню
     app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
+
+    # Inline-колбэки админа
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin)$"))
 
+    # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
+
+    # Автоудаление неизвестных сообщений
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("getid", getid))
     app.add_handler(CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")))
