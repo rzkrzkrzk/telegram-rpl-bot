@@ -379,7 +379,7 @@ async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ---------- Админ-панель (исправлена) ----------
+# ---------- Админ-панель ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Команда только в личных сообщениях.")
@@ -403,7 +403,7 @@ async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text
     if check_credentials(login, password):
         add_admin(update.effective_user.id)
-        context.user_data.clear()  # очищаем все временные данные
+        context.user_data.clear()
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
     else:
@@ -439,8 +439,9 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings(update, context)
         return
     elif text == "🎮 Настройки игры":
-        # Полная очистка всех временных данных перед входом в настройки игры
+        # Принудительно сбрасываем все состояния и завершаем любые диалоги
         context.user_data.clear()
+        # Отправляем настройки игры новым сообщением
         await show_game_settings(update, context)
         return ConversationHandler.END
     elif text == "🚪 Выйти":
@@ -559,12 +560,10 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "  (нет)\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
-# ---------- Настройки игры (исправлены) ----------
+# ---------- Настройки игры ----------
 async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает настройки игры с возможностью просмотра и смены GIF."""
-    # Убеждаемся, что все временные данные очищены (это уже сделано перед вызовом, но на всякий случай)
-    context.user_data.clear()
-
+    context.user_data.clear()  # на всякий случай
     goal_gif = get_config('gif_goal') or 'не установлен'
     save_gif = get_config('gif_save') or 'не установлен'
     text = (
@@ -580,11 +579,8 @@ async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
          InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
     ])
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        await update.callback_query.answer()
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    # Отправляем новое сообщение (не редактируем), чтобы избежать конфликтов
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def view_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     query = update.callback_query
@@ -629,13 +625,15 @@ async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_ty
         key = 'gif_goal' if gif_type == 'goal' else 'gif_save'
         set_config(key, file_id)
         await update.message.reply_text("✅ GIF сохранён!", reply_markup=admin_menu_keyboard())
-        # Полная очистка временных данных перед показом настроек
+        # Завершаем диалог
         context.user_data.clear()
+        # Показываем настройки игры
         await show_game_settings(update, context)
+        return ConversationHandler.END
     else:
         await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
-    context.user_data["in_conversation"] = False
-    return ConversationHandler.END
+        context.user_data["in_conversation"] = False
+        return ConversationHandler.END
 
 # ---------- Инлайн-колбэки для админа ----------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
