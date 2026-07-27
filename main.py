@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import random
 import uuid
+import time
 from datetime import datetime
 
 from telegram import (
@@ -35,23 +36,23 @@ DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 ADMIN_SESSION_MINUTES = 30
 
 # Состояния ConversationHandler
-WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
+(WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, 
+ WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG) = range(6)
 WAITING_DUEL_SHOT = 10
 WAITING_GIF_UPLOAD = 11
 WAITING_GAME_SETTINGS = 12
 
 # Настройки «Дуэли Клюшек»
 STICK_DUEL_SEARCH_SECONDS = 45
-STICK_DUEL_TOTAL_TURNS = 6  # По 3 буллита каждому
+STICK_DUEL_TOTAL_TURNS = 6
 INITIAL_MMR = 1000
-K_FACTOR = 32 # Коэффициент изменения MMR
 
-# Глобальная очередь позволяет находить игроков даже в разных чатах.
-# Состояние игр хранится в памяти и сбрасывается при перезапуске бота.
-stick_duel_searches = {}  # user_id -> search
-stick_duel_games = {}     # game_id -> game
-stick_duel_by_user = {}   # user_id -> game_id
+# Глобальные переменные
+stick_duel_searches = {}  
+stick_duel_games = {}     
+stick_duel_by_user = {}   
 stick_duel_lock = asyncio.Lock()
+bullet_cooldowns = {} # user_id -> timestamp
 
 SHOT_LABELS = {
     "right": "Правая девятка",
@@ -63,65 +64,76 @@ SAVE_LABELS = {
     "home": "Домик",
 }
 
-
 # ---------- БД ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS source_channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER UNIQUE,
-        username TEXT,
-        added_by INTEGER
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE,
+        username TEXT, added_by INTEGER
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS target_chats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER UNIQUE,
-        link TEXT,
-        added_by INTEGER
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE,
+        link TEXT, added_by INTEGER
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS support_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        text TEXT,
-        timestamp TEXT,
-        answered INTEGER DEFAULT 0
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        username TEXT, text TEXT, timestamp TEXT, answered INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY,
-        last_activity INTEGER
+        user_id INTEGER PRIMARY KEY, last_activity INTEGER
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS bot_config (
-        key TEXT PRIMARY KEY,
-        value TEXT
+        key TEXT PRIMARY KEY, value TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS duel_stats (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        total_shots INTEGER DEFAULT 0,
-        goals INTEGER DEFAULT 0
+        user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+        total_shots INTEGER DEFAULT 0, goals INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS mmr_stats (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        mmr INTEGER DEFAULT 1000,
-        games_played INTEGER DEFAULT 0
+        user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+        mmr INTEGER DEFAULT 1000, games_played INTEGER DEFAULT 0
     )''')
-
-    # Инициализация GIF конфигов
     for i in range(1, 4):
         c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', (f'gif_goal_{i}', ''))
         c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', (f'gif_save_{i}', ''))
     conn.commit()
     conn.close()
 
-
 init_db()
 
+# ---------- MMR Логика ----------
+def calculate_dynamic_mmr(player_mmr, won):
+    """
+    Разброс: 1000 ммр = +/- 15.
+    Если ммр ниже 1000, плюс больше, минус меньше.
+    """
+    base = 15
+    diff = 1000 - player_mmr
+    # За каждые 50 ммр ниже 1000 добавляем 2 к выигрышу и вычитаем 1 из проигрыша
+    modifier = diff // 50 
+    
+    if won:
+        change = base + (modifier * 2 if modifier > 0 else modifier)
+    else:
+        change = -(base - (modifier if modifier > 0 else modifier // 2))
+    
+    return int(max(5, change)) if won else int(min(-5, change))
 
+def update_stick_duel_mmr_stats(winner_data, loser_data):
+    if winner_data["is_bot"] or loser_data["is_bot"]:
+        return
+
+    w_info = get_mmr_user(winner_data["id"], winner_data.get("username"), winner_data["name"])
+    l_info = get_mmr_user(loser_data["id"], loser_data.get("username"), loser_data["name"])
+
+    w_change = calculate_dynamic_mmr(w_info["mmr"], True)
+    l_change = calculate_dynamic_mmr(l_info["mmr"], False)
+
+    update_mmr(winner_data["id"], winner_data.get("username"), winner_data["name"], w_change)
+    update_mmr(loser_data["id"], loser_data.get("username"), loser_data["name"], l_change)
+
+# ---------- Функции БД ----------
 def update_duel_stats(user_id, username, first_name, is_goal):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -129,35 +141,46 @@ def update_duel_stats(user_id, username, first_name, is_goal):
     c.execute('''INSERT INTO duel_stats (user_id, username, first_name, total_shots, goals)
                  VALUES (?, ?, ?, 1, ?)
                  ON CONFLICT(user_id) DO UPDATE SET
-                 username = excluded.username,
-                 first_name = excluded.first_name,
-                 total_shots = total_shots + 1,
-                 goals = goals + ?''',
+                 username = excluded.username, first_name = excluded.first_name,
+                 total_shots = total_shots + 1, goals = goals + ?''',
               (user_id, username, first_name, goal_inc, goal_inc))
     conn.commit()
     conn.close()
 
+def get_mmr_user(user_id, username, first_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT mmr, games_played FROM mmr_stats WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    if not row:
+        c.execute('INSERT INTO mmr_stats (user_id, username, first_name, mmr, games_played) VALUES (?, ?, ?, 1000, 0)',
+                  (user_id, username, first_name))
+        conn.commit()
+        mmr, games = 1000, 0
+    else:
+        mmr, games = row
+    conn.close()
+    return {"mmr": mmr, "games_played": games}
+
+def update_mmr(user_id, username, first_name, mmr_change):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''UPDATE mmr_stats SET mmr = mmr + ?, games_played = games_played + 1,
+                 username = ?, first_name = ? WHERE user_id = ?''', 
+              (mmr_change, username, first_name, user_id))
+    conn.commit()
+    conn.close()
 
 def get_top_rating():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''SELECT first_name, username, goals, total_shots,
                  (CAST(goals AS FLOAT) / total_shots * 100) AS percent
-                 FROM duel_stats
-                 WHERE total_shots >= 7
+                 FROM duel_stats WHERE total_shots >= 7
                  ORDER BY percent DESC LIMIT 10''')
     rows = c.fetchall()
     conn.close()
     return rows
-
-
-def reset_bullet_duel_ratings():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM duel_stats')
-    conn.commit()
-    conn.close()
-
 
 def get_config(key):
     conn = sqlite3.connect(DB_PATH)
@@ -167,14 +190,12 @@ def get_config(key):
     conn.close()
     return row[0] if row else ''
 
-
 def set_config(key, value):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO bot_config (key, value) VALUES (?, ?)', (key, value))
     conn.commit()
     conn.close()
-
 
 def get_all_gifs(prefix):
     conn = sqlite3.connect(DB_PATH)
@@ -183,75 +204,9 @@ def get_all_gifs(prefix):
     for i in range(1, 4):
         c.execute('SELECT value FROM bot_config WHERE key = ?', (f'{prefix}_{i}',))
         row = c.fetchone()
-        if row and row[0]:
-            gifs.append(row[0])
+        if row and row[0]: gifs.append(row[0])
     conn.close()
     return gifs if gifs else None
-
-
-def add_source_channel(chat_id, username, added_by):
-    conn = sqlite3(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO source_channels (chat_id, username, added_by) VALUES (?, ?, ?)',
-              (chat_id, username, added_by))
-    conn.commit()
-    conn.close()
-
-
-def get_source_channels():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT chat_id, username FROM source_channels')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def add_target_chat(chat_id, link, added_by):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO target_chats (chat_id, link, added_by) VALUES (?, ?, ?)',
-              (chat_id, link, added_by))
-    conn.commit()
-    conn.close()
-
-
-def get_target_chats():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT chat_id, link FROM target_chats')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def add_support_message(user_id, username, text):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO support_messages (user_id, username, text, timestamp) VALUES (?, ?, ?, ?)',
-              (user_id, username, text, datetime.now().isoformat()))
-    conn.commit()
-    msg_id = c.lastrowid
-    conn.close()
-    return msg_id
-
-
-def get_unanswered_messages():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, user_id, username, text, timestamp FROM support_messages WHERE answered = 0 ORDER BY id')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def mark_answered(msg_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE support_messages SET answered = 1 WHERE id = ?', (msg_id,))
-    conn.commit()
-    conn.close()
-
 
 def is_admin(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -260,11 +215,8 @@ def is_admin(user_id):
     row = c.fetchone()
     conn.close()
     if row:
-        if (datetime.now().timestamp() - row[0]) < ADMIN_SESSION_MINUTES * 60:
-            return True
-        remove_admin(user_id)
+        if (datetime.now().timestamp() - row[0]) < ADMIN_SESSION_MINUTES * 60: return True
     return False
-
 
 def add_admin(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -274,16 +226,6 @@ def add_admin(user_id):
     conn.commit()
     conn.close()
 
-
-def update_admin_activity(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE admins SET last_activity = ? WHERE user_id = ?',
-              (int(datetime.now().timestamp()), user_id))
-    conn.commit()
-    conn.close()
-
-
 def remove_admin(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -291,132 +233,35 @@ def remove_admin(user_id):
     conn.commit()
     conn.close()
 
-
 def check_credentials(login, password):
     credentials = {"goyda1488": "goydarpl", "rzk1488": "rzksigma"}
     return credentials.get(login) == password
 
-
-# ---------- MMR функции ----------
-def get_mmr_user(user_id, username, first_name):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT mmr, games_played FROM mmr_stats WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    if row:
-        mmr, games_played = row
-    else:
-        # Создаем запись, если пользователь не найден
-        mmr, games_played = INITIAL_MMR, 0
-        c.execute('INSERT INTO mmr_stats (user_id, username, first_name, mmr, games_played) VALUES (?, ?, ?, ?, ?)',
-                  (user_id, username, first_name, mmr, games_played))
-        conn.commit()
-    conn.close()
-    return {"mmr": mmr, "games_played": games_played}
-
-
-def update_mmr(user_id, username, first_name, mmr_change):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO mmr_stats (user_id, username, first_name, mmr, games_played) VALUES (?, ?, ?, ?, ?)\n'
-              'ON CONFLICT(user_id) DO UPDATE SET\n'
-              'username = excluded.username,\n'
-              'first_name = excluded.first_name,\n'
-              'mmr = mmr + ?,\n'
-              'games_played = games_played + 1',
-              (user_id, username, first_name, INITIAL_MMR, 1, mmr_change))
-    conn.commit()
-    conn.close()
-
-
-def calculate_elo_change(player_mmr, opponent_mmr, won):
-    """Рассчитывает изменение MMR по формуле Эло."""
-    expected_score = 1 / (1 + 10 ** ((opponent_mmr - player_mmr) / 400))
-    actual_score = 1 if won else 0
-    return round(K_FACTOR * (actual_score - expected_score))
-
-
-def update_stick_duel_mmr_stats(winner_player_data, loser_player_data):
-    winner_id = winner_player_data["id"]
-    winner_username = winner_player_data.get("username")
-    winner_name = winner_player_data["name"]
-
-    loser_id = loser_player_data["id"]
-    loser_username = loser_player_data.get("username")
-    loser_name = loser_player_data["name"]
-
-    # ИИ не участвует в MMR
-    if winner_player_data["is_bot"] or loser_player_data["is_bot"]:
-        return
-
-    winner_current_mmr = get_mmr_user(winner_id, winner_username, winner_name)["mmr"]
-    loser_current_mmr = get_mmr_user(loser_id, loser_username, loser_name)["mmr"]
-
-    winner_mmr_change = calculate_elo_change(winner_current_mmr, loser_current_mmr, True)
-    loser_mmr_change = calculate_elo_change(loser_current_mmr, winner_current_mmr, False)
-
-    update_mmr(winner_id, winner_username, winner_name, winner_mmr_change)
-    update_mmr(loser_id, loser_username, loser_name, loser_mmr_change)
-
-
-def get_top_mmr_rating():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''SELECT first_name, username, mmr, games_played
-                 FROM mmr_stats
-                 WHERE games_played > 0
-                 ORDER BY mmr DESC LIMIT 10''')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def reset_stick_duel_mmr_ratings():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM mmr_stats')
-    conn.commit()
-    conn.close()
-
-
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
-    return ReplyKeyboardMarkup([["🏠 Главное меню"]], resize_keyboard=True)
-
-
-def admin_menu_keyboard():
-    return ReplyKeyboardMarkup([
-        ["➕ Добавить каналы", "➕ Добавить чаты"],
-        ["📩 Проверить поддержку", "⚙️ Настройки"],
-        ["🎮 Настройки игры", "🚪 Выйти"], # Убрано "🧹 Обнулить рейтинг"
-    ], resize_keyboard=True)
-
+    return ReplyKeyboardMarkup([["🏠 Главное меню"], ["👤 Мой Профиль"]], resize_keyboard=True)
 
 def welcome_inline_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel"), 
+         InlineKeyboardButton("⚔️ Дуэль Клюшек", callback_data="regrpl_btn")],
         [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
         [InlineKeyboardButton("🌐 Наш Сайт", callback_data="website")],
-        [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")],
-        [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
     ])
-
 
 def duel_shot_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🥅 Левая девятка", callback_data="shot_left")],
-        [InlineKeyboardButton("🥅 Правая девятка", callback_data="shot_right")],
-        [InlineKeyboardButton("🧤 Домик", callback_data="shot_five")],
-        [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")],
+        [InlineKeyboardButton("🥅 Лев. девятка", callback_data="shot_left"), InlineKeyboardButton("🥅 Пр. девятка", callback_data="shot_right")],
+        [InlineKeyboardButton("🧤 Домик", callback_data="shot_five"), InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")],
     ])
-
 
 def stick_search_keyboard(owner_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принять", callback_data=f"rpl_accept:{owner_id}")],
-        [InlineKeyboardButton("🤖 Играть с ИИ", callback_data=f"rpl_ai:{owner_id}")],
-        [InlineKeyboardButton("❌ Отменить поиск", callback_data=f"rpl_cancel:{owner_id}")],
+        [InlineKeyboardButton("🤖 С ботом", callback_data=f"rpl_ai:{owner_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"rpl_cancel:{owner_id}")],
     ])
-
 
 def stick_shot_keyboard(game_id, turn):
     return InlineKeyboardMarkup([
@@ -425,912 +270,274 @@ def stick_shot_keyboard(game_id, turn):
         [InlineKeyboardButton("Домик", callback_data=f"rpl_shot:{game_id}:{turn}:home")],
     ])
 
-
 def stick_save_keyboard(game_id, turn):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Девятки", callback_data=f"rpl_save:{game_id}:{turn}:nines")],
         [InlineKeyboardButton("Домик", callback_data=f"rpl_save:{game_id}:{turn}:home")],
     ])
 
-def game_settings_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Настройки Дуэли Буллитов", callback_data="game_settings_bullet")],
-        [InlineKeyboardButton("Настройки Дуэли Клюшек", callback_data="game_settings_stick")],
-        [InlineKeyboardButton("⬅️ Назад в Админ-панель", callback_data="admin_back_to_main")],
-    ])
-
-def bullet_duel_settings_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("GOAL GIF 1", callback_data="set_gif_goal_1"),
-            InlineKeyboardButton("GOAL GIF 2", callback_data="set_gif_goal_2"),
-            InlineKeyboardButton("GOAL GIF 3", callback_data="set_gif_goal_3"),
-        ],
-        [
-            InlineKeyboardButton("SAVE GIF 1", callback_data="set_gif_save_1"),
-            InlineKeyboardButton("SAVE GIF 2", callback_data="set_gif_save_2"),
-            InlineKeyboardButton("SAVE GIF 3", callback_data="set_gif_save_3"),
-        ],
-        [InlineKeyboardButton("♻️ Обнулить рейтинг «Дуэли Буллитов»", callback_data="reset_bullet_rating")],
-        [InlineKeyboardButton("⬅️ Назад в Настройки игр", callback_data="game_settings_back")],
-    ])
-
-def stick_duel_settings_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("♻️ Обнулить рейтинг MMR «Дуэли Клюшек»", callback_data="reset_stick_mmr_rating")],
-        [InlineKeyboardButton("⬅️ Назад в Настройки игр", callback_data="game_settings_back")],
-    ])
-
-
 # ---------- Общие обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Добро пожаловать в Russian Puck League!", reply_markup=main_menu_keyboard())
     await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
 
+async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT goals, total_shots FROM duel_stats WHERE user_id = ?', (user.id,))
+    bullet = c.fetchone()
+    c.execute('SELECT mmr, games_played FROM mmr_stats WHERE user_id = ?', (user.id,))
+    stick = c.fetchone()
+    conn.close()
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
+    text = f"👤 **Профиль игрока {user.first_name}**\n\n"
+    
+    if bullet and bullet[1] >= 7:
+        perc = (bullet[0] / bullet[1]) * 100
+        text += f"🏒 **Дуэль Буллитов:**\n└ Рейтинг: {perc:.1f}% ({bullet[0]}/{bullet[1]} гол.)\n\n"
+    else:
+        text += f"🏒 **Дуэль Буллитов:**\n└ *Недостаточно матчей для рейтинга (нужно 7)*\n\n"
 
+    if stick and stick[1] > 0:
+        mmr = stick[0]
+        rank = "Новичок"
+        if mmr > 1200: rank = "Профи"
+        if mmr > 1500: rank = "Легенда RPL"
+        text += f"⚔️ **Дуэль Клюшек:**\n└ MMR: {mmr}\n└ Игр: {stick[1]}\n└ Звание: {rank}\n\n"
+    else:
+        text += f"⚔️ **Дуэль Клюшек:**\n└ *Еще не играл*\n\n"
+
+    text += "🔥 Удачи на льду!"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-
-    if data == "discord":
-        await query.edit_message_text("💬 Discord Server RPL: https://discord.gg/dgkFMCgDwx")
-        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
-    elif data == "website":
-        await query.edit_message_text("🌐 Сайт Russian Puck League: rplpuck.ru")
-        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
-    elif data == "support":
+    if query.data == "regrpl_btn":
+        await regrpl_command(update, context)
+    elif query.data == "duel":
+        await start_duel_command(update, context)
+    elif query.data == "support":
         context.user_data["in_conversation_support"] = True
         await query.edit_message_text("✍️ Напишите сообщение поддержке или /cancel")
         return WAITING_SUPPORT_MSG
-    elif data == "duel":
-        await query.edit_message_text("🏒 Дуэль Буллитов! Выбери зону для броска:", reply_markup=duel_shot_keyboard())
-        return WAITING_DUEL_SHOT
+    # ... остальные кнопки (discord, website) ...
 
-
-# ---------- Старая одиночная «Дуэль Буллитов» ----------
+# ---------- Дуэль Буллитов (с КД) ----------
 async def start_duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if update.effective_chat.type != "private":
-        context.user_data[f"in_duel_{user.id}"] = True
-        await update.message.reply_text(
-            f"🏒 {user.first_name}, твоя очередь! Выбери зону:",
-            reply_markup=duel_shot_keyboard(),
-        )
+    now = time.time()
+    
+    if user.id in bullet_cooldowns:
+        remains = int(300 - (now - bullet_cooldowns[user.id]))
+        if remains > 0:
+            msg = f"⏳ Подожди еще {remains // 60} мин. {remains % 60} сек. перед следующей дуэлью!"
+            if update.callback_query:
+                await update.callback_query.message.reply_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            return ConversationHandler.END
+
+    bullet_cooldowns[user.id] = now
+    text = "🏒 Дуэль Буллитов! Выбери зону для броска:"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=duel_shot_keyboard())
     else:
-        await update.message.reply_text("🏒 Дуэль Буллитов! Выбери зону:", reply_markup=duel_shot_keyboard())
+        await update.message.reply_text(text, reply_markup=duel_shot_keyboard())
     return WAITING_DUEL_SHOT
-
-
-async def rating_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    top = get_top_rating()
-    if not top:
-        await update.message.reply_text("📊 Рейтинг Дуэли Буллитов пуст. Нужно минимум 7 бросков для попадания в ТОП!")
-        return
-
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    text = "🏆 **ТОП-10 ИГРОКОВ RPL (Дуэль Буллитов)**\n\n"
-    for i, row in enumerate(top):
-        first_name, username, goals, total, percent = row
-        user_label = f"(@{username})" if username else ""
-        text += f"{medals[i]} {first_name}{user_label}: {percent:.1f}% забитых бросков ({goals}/{total})\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    shot_zone = query.data
     user = query.from_user
-
+    shot_zone = query.data
+    
     goalie_zones = ["shot_left", "shot_right", "shot_five", "shot_low"]
     goalie_choice = random.choice(goalie_zones)
     scored = random.random() < 0.35 if shot_zone != goalie_choice else False
 
     update_duel_stats(user.id, user.username, user.first_name, scored)
 
-    if scored:
-        gifs = get_all_gifs('gif_goal')
-        gif = random.choice(gifs) if gifs else "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"
-        result_text = "⚡️ **ГОЛ!** Вы точно попали в девятку!"
-    else:
-        gifs = get_all_gifs('gif_save')
-        gif = random.choice(gifs) if gifs else "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"
-        result_text = "🧤 **СЕЙВ!** Вратарь отразил бросок!"
+    res = "🚨 **ГОЛ!**" if scored else "🧤 **СЕЙВ!**"
+    gifs = get_all_gifs('gif_goal' if scored else 'gif_save')
+    gif = random.choice(gifs) if gifs else None
 
-    await query.edit_message_text(
-        f"{result_text}\n"
-        f"Ваш бросок: {shot_zone.replace('shot_', '').capitalize()}\n"
-        f"Вратарь выбрал: {goalie_choice.replace('shot_', '').capitalize()}"
-    )
-
-    try:
-        await query.message.reply_animation(gif)
-    except Exception as e:
-        logger.error("Ошибка отправки GIF: %s", e)
-
-    if update.effective_chat.type != "private":
-        context.user_data.pop(f"in_duel_{user.id}", None)
-
-    if update.effective_chat.type == "private":
-        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
-
+    await query.edit_message_text(f"{res}\nТвой бросок: {shot_zone}\nВратарь: {goalie_choice}")
+    if gif:
+        try: await query.message.reply_animation(gif)
+        except: pass
+    
+    await query.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
     return ConversationHandler.END
 
-
-# ---------- Новая мини-игра «Дуэль Клюшек» ----------
+# ---------- Дуэль Клюшек (с Анти-спамом и сложностью) ----------
 def stick_player(user, chat_id):
-    return {
-        "id": user.id,
-        "name": user.first_name or user.username or str(user.id),
-        "username": user.username,
-        "chat_id": chat_id,
-        "is_bot": False,
-    }
-
+    return {"id": user.id, "name": user.first_name or "Игрок", "username": user.username, "chat_id": chat_id, "is_bot": False, "last_msg": None}
 
 def stick_ai_player():
-    return {
-        "id": 0,
-        "name": "ИИ",
-        "username": None,
-        "chat_id": None,
-        "is_bot": True,
-    }
-
-
-def cancel_search_task(search):
-    task = search.get("task")
-    if task and task is not asyncio.current_task() and not task.done():
-        task.cancel()
-
-
-async def safe_edit_search(bot, search, text):
-    try:
-        await bot.edit_message_text(
-            chat_id=search["chat_id"],
-            message_id=search["message_id"],
-            text=text,
-            reply_markup=None # убираем кнопки после завершения
-        )
-    except Exception as e:
-        logger.debug("Не удалось изменить сообщение поиска: %s", e)
-
+    return {"id": 0, "name": "Бот-Вратарь", "username": None, "chat_id": None, "is_bot": True}
 
 async def send_to_stick_game(bot, game, text, reply_markup=None):
-    """Отправляет одно сообщение в каждый уникальный чат участников."""
-    sent_chats = set()
+    """Удаляет старое и пишет новое сообщение для каждого игрока."""
     for player in game["players"]:
-        chat_id = player.get("chat_id")
-        if player["is_bot"] or chat_id is None or chat_id in sent_chats:
-            continue
-        sent_chats.add(chat_id)
+        if player["is_bot"] or not player["chat_id"]: continue
+        
+        # Удаляем старое
+        if player["last_msg"]:
+            try: await bot.delete_message(player["chat_id"], player["last_msg"])
+            except: pass
+            
+        # Пишем новое
         try:
-            # Если это последняя стадия игры, убираем кнопки
-            current_reply_markup = reply_markup if game["stage"] != "finished" else None
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=current_reply_markup)
-        except Exception as e:
-            logger.error("Не удалось отправить состояние Дуэли Клюшек в чат %s: %s", chat_id, e)
-
-
-async def begin_stick_game_locked(bot, first_player, second_player, searches):
-    """Создаёт игру. Вызывается только внутри stick_duel_lock."""
-    for search in searches:
-        cancel_search_task(search)
-
-    game_id = uuid.uuid4().hex[:12]
-    game = {
-        "id": game_id,
-        "players": [first_player, second_player],
-        "turn": 0,
-        "stage": "starting",
-        "shot": None,
-        "score": [0, 0],
-    }
-    stick_duel_games[game_id] = game
-
-    for player in game["players"]:
-        if not player["is_bot"]:
-            stick_duel_by_user[player["id"]] = game_id
-
-    match_text = (
-        "🏒 Соперник найден! Начинается «Дуэль Клюшек».\n"
-        f"{first_player['name']} против {second_player['name']}.\n"
-        f"Первым бросает {first_player['name']}."
-    )
-    for search in searches:
-        await safe_edit_search(bot, search, match_text)
-
-    await send_to_stick_game(bot, game, match_text)
-    await send_stick_turn_locked(bot, game)
-
-
-async def finish_stick_game_locked(bot, game):
-    p1, p2 = game["players"]
-    score1, score2 = game["score"]
-
-    winner_player = None
-    loser_player = None
-
-    if score1 > score2:
-        ending = f"🏆 Победитель: {p1['name']}!"
-        winner_player = p1
-        loser_player = p2
-    elif score2 > score1:
-        ending = f"🏆 Победитель: {p2['name']}!"
-        winner_player = p2
-        loser_player = p1
-    else:
-        ending = "🤝 Ничья!"
-
-    text = (
-        "🏁 Дуэль Клюшек завершена!\n\n"
-        f"Итоговый счёт: {p1['name']} {score1}:{score2} {p2['name']}\n"
-        f"{ending}"
-    )
-    game["stage"] = "finished" # Устанавливаем стадию завершения для send_to_stick_game
-    await send_to_stick_game(bot, game, text)
-
-    # Обновление MMR
-    if winner_player and loser_player:
-        update_stick_duel_mmr_stats(winner_player, loser_player)
-        # Добавляем информацию об изменении MMR в финальное сообщение
-        winner_mmr_info = get_mmr_user(winner_player['id'], winner_player.get('username'), winner_player['name'])
-        loser_mmr_info = get_mmr_user(loser_player['id'], loser_player.get('username'), loser_player['name'])
-        mmr_text = f"\n\n📊 MMR обновлен:\n" \
-                   f"{winner_player['name']}: {winner_mmr_info['mmr']} (сыграно: {winner_mmr_info['games_played']})\n" \
-                   f"{loser_player['name']}: {loser_mmr_info['mmr']} (сыграно: {loser_mmr_info['games_played']})"
-        await send_to_stick_game(bot, game, mmr_text)
-
-
-    for player in game["players"]:
-        if not player["is_bot"]:
-            stick_duel_by_user.pop(player["id"], None)
-    stick_duel_games.pop(game["id"], None)
-
+            msg = await bot.send_message(player["chat_id"], text, reply_markup=reply_markup)
+            player["last_msg"] = msg.message_id
+        except: pass
 
 async def resolve_stick_shot_locked(bot, game, save_choice):
-    attacker_index = game["turn"] % 2
-    goalie_index = 1 - attacker_index
-    attacker = game["players"][attacker_index]
-    goalie = game["players"][goalie_index]
+    turn = game["turn"]
+    att_idx = turn % 2
+    goal_idx = 1 - att_idx
+    att, goalie = game["players"][att_idx], game["players"][goal_idx]
     shot = game["shot"]
 
-    saved = (
-        (save_choice == "nines" and shot in ("right", "left"))
-        or (save_choice == "home" and shot == "home")
-    )
+    saved = (save_choice == "nines" and shot in ("right", "left")) or (save_choice == "home" and shot == "home")
     is_goal = not saved
+    if is_goal: game["score"][att_idx] += 1
 
-    if is_goal:
-        game["score"][attacker_index] += 1
-        result = "🚨 ГОЛ!"
-    else:
-        result = "🧤 СЕЙВ!"
-
-    if not attacker["is_bot"]:
-        update_duel_stats(
-            attacker["id"],
-            attacker.get("username"),
-            attacker["name"],
-            is_goal,
-        )
-
-    score1, score2 = game["score"]
-    p1, p2 = game["players"]
-    text = (
-        f"{result}\n"
-        f"Нападающий {attacker['name']}: {SHOT_LABELS[shot]}.\n"
-        f"Вратарь {goalie['name']}: {SAVE_LABELS[save_choice]}.\n\n"
-        f"Счёт: {p1['name']} {score1}:{score2} {p2['name']}"
-    )
-    await send_to_stick_game(bot, game, text)
-
+    res = "🚨 ГОЛ!" if is_goal else "🧤 СЕЙВ!"
+    score_text = f"Счёт: {game['players'][0]['name']} {game['score'][0]}:{game['score'][1]} {game['players'][1]['name']}"
+    
+    await send_to_stick_game(bot, game, f"{res}\n{att['name']} бил в {SHOT_LABELS[shot]}\n{goalie['name']} выбрал {SAVE_LABELS[save_choice]}\n\n{score_text}")
+    
     game["turn"] += 1
     game["shot"] = None
     if game["turn"] >= STICK_DUEL_TOTAL_TURNS:
         await finish_stick_game_locked(bot, game)
     else:
+        await asyncio.sleep(2)
         await send_stick_turn_locked(bot, game)
-
 
 async def send_stick_turn_locked(bot, game):
     turn = game["turn"]
-    attacker_index = turn % 2
-    goalie_index = 1 - attacker_index
-    attacker = game["players"][attacker_index]
-    goalie = game["players"][goalie_index]
-    personal_shot_number = turn // 2 + 1
+    att_idx = turn % 2
+    goal_idx = 1 - att_idx
+    att, goalie = game["players"][att_idx], game["players"][goal_idx]
+    
+    header = f"🏒 Раунд {turn//2 + 1}/3\nНападает: {att['name']}\nВратарь: {goalie['name']}\n"
 
-    header = (
-        f"🏒 Буллит {personal_shot_number}/3 для {attacker['name']}\n"
-        f"Вратарь — {goalie['name']}, Нападающий — {attacker['name']}\n\n"
-    )
-
-    if attacker["is_bot"]:
+    if att["is_bot"]:
         game["shot"] = random.choice(list(SHOT_LABELS))
         game["stage"] = "save"
-        await send_to_stick_game(
-            bot,
-            game,
-            header
-            + f"Сейчас {attacker['name']} выбирает, куда бросить.\n"
-            + f"Сейчас {goalie['name']} выбирает, как отбить.",
-            reply_markup=stick_save_keyboard(game["id"], turn),
-        )
+        await send_to_stick_game(bot, game, header + "Бот сделал выбор! Вратарь, твой выход:", reply_markup=stick_save_keyboard(game["id"], turn))
     else:
         game["stage"] = "shot"
-        await send_to_stick_game(
-            bot,
-            game,
-            header + f"Сейчас {attacker['name']} выбирает, куда бросить.",
-            reply_markup=stick_shot_keyboard(game["id"], turn),
-        )
+        await send_to_stick_game(bot, game, header + "Нападающий, выбирай зону:", reply_markup=stick_shot_keyboard(game["id"], turn))
 
+async def finish_stick_game_locked(bot, game):
+    p1, p2 = game["players"]
+    s1, s2 = game["score"]
+    
+    win_text = "🤝 Ничья!"
+    if s1 > s2:
+        win_text = f"🏆 Победил {p1['name']}!"
+        update_stick_duel_mmr_stats(p1, p2)
+    elif s2 > s1:
+        win_text = f"🏆 Победил {p2['name']}!"
+        update_stick_duel_mmr_stats(p2, p1)
 
-async def stick_search_timeout(application, owner_id):
-    try:
-        await asyncio.sleep(STICK_DUEL_SEARCH_SECONDS)
-        async with stick_duel_lock:
-            search = stick_duel_searches.pop(owner_id, None)
-            if not search:
-                return
-
-            player = search["player"]
-            await safe_edit_search(
-                application.bot,
-                search,
-                "⌛ Соперник не найден за 45 секунд. Начинается игра с ИИ!",
-            )
-            await begin_stick_game_locked(
-                application.bot,
-                player,
-                stick_ai_player(),
-                [search],
-            )
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("Ошибка таймера поиска Дуэли Клюшек")
-
+    await send_to_stick_game(bot, game, f"🏁 Игра окончена!\nСчёт {s1}:{s2}\n{win_text}\n\nMMR обновлен в профиле.")
+    for p in game["players"]:
+        if not p["is_bot"]: stick_duel_by_user.pop(p["id"], None)
+    stick_duel_games.pop(game["id"], None)
 
 async def regrpl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
-
     async with stick_duel_lock:
         if user.id in stick_duel_by_user:
-            await update.message.reply_text("⚠️ Ты уже участвуешь в Дуэли Клюшек.")
+            await update.effective_message.reply_text("⚠️ Ты уже в игре!")
             return
-        if user.id in stick_duel_searches:
-            await update.message.reply_text("🔎 Ты уже ищешь соперника.")
-            return
-
-        # Берём самого первого ожидающего игрока из общей очереди всех чатов.
-        opponent_id = next(iter(stick_duel_searches), None)
-        if opponent_id is not None:
-            opponent_search = stick_duel_searches.pop(opponent_id)
-            cancel_search_task(opponent_search)
-            await begin_stick_game_locked(
-                context.bot,
-                opponent_search["player"],
-                stick_player(user, chat_id),
-                [opponent_search],
-            )
-            return
-
-        message = await update.message.reply_text(
-            f"🔎 {user.first_name}, начат поиск соперника!\n"
-            f"Ожидание: {STICK_DUEL_SEARCH_SECONDS} секунд.\n"
-            "Если никто не найдётся, игра начнётся с ИИ.",
-            reply_markup=stick_search_keyboard(user.id),
-        )
-        search = {
-            "player": stick_player(user, chat_id),
-            "chat_id": chat_id,
-            "message_id": message.message_id,
-            "task": None,
-        }
-        stick_duel_searches[user.id] = search
-        search["task"] = asyncio.create_task(stick_search_timeout(context.application, user.id))
-
+        
+        opp_id = next(iter(stick_duel_searches), None)
+        if opp_id and opp_id != user.id:
+            search = stick_duel_searches.pop(opp_id)
+            game_id = uuid.uuid4().hex[:8]
+            game = {"id": game_id, "players": [search["player"], stick_player(user, chat_id)], "turn": 0, "score": [0,0], "stage": "start"}
+            stick_duel_games[game_id] = game
+            stick_duel_by_user[user.id] = game_id
+            stick_duel_by_user[opp_id] = game_id
+            await send_stick_turn_locked(context.bot, game)
+        else:
+            msg = await update.effective_message.reply_text("🔎 Поиск соперника...", reply_markup=stick_search_keyboard(user.id))
+            stick_duel_searches[user.id] = {"player": stick_player(user, chat_id), "msg_id": msg.message_id}
 
 async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
     user = query.from_user
-
+    data = query.data.split(":")
+    
     async with stick_duel_lock:
-        # Кнопки поиска
-        if data.startswith("rpl_accept:"):
-            owner_id = int(data.split(":", 1)[1])
-            search = stick_duel_searches.get(owner_id)
-            if not search:
-                await query.answer("Поиск уже завершён.", show_alert=True)
-                return
-            if user.id == owner_id:
-                await query.answer("Нельзя принять собственный поиск 🙂", show_alert=True)
-                return
-            if user.id in stick_duel_by_user:
-                await query.answer("Ты уже участвуешь в другой игре.", show_alert=True)
-                return
-
-            await query.answer()
-            stick_duel_searches.pop(owner_id, None)
-            cancel_search_task(search)
-            searches = [search]
-
-            # Если принявший игрок сам искал соперника в другом чате,
-            # его старый поиск также закрывается.
-            own_search = stick_duel_searches.pop(user.id, None)
-            if own_search:
-                cancel_search_task(own_search)
-                searches.append(own_search)
-
-            await begin_stick_game_locked(
-                context.bot,
-                search["player"],
-                stick_player(user, query.message.chat.id),
-                searches,
-            )
+        if data[0] == "rpl_ai":
+            owner = int(data[1])
+            if user.id != owner: return
+            search = stick_duel_searches.pop(user.id, None)
+            game_id = uuid.uuid4().hex[:8]
+            game = {"id": game_id, "players": [search["player"], stick_ai_player()], "turn": 0, "score": [0,0], "stage": "start"}
+            stick_duel_games[game_id] = game
+            stick_duel_by_user[user.id] = game_id
+            await send_stick_turn_locked(context.bot, game)
             return
 
-        if data.startswith("rpl_ai:"):
-            owner_id = int(data.split(":", 1)[1])
-            if user.id != owner_id:
-                await query.answer("Игру с ИИ может запустить только автор поиска.", show_alert=True)
-                return
-            search = stick_duel_searches.pop(owner_id, None)
-            if not search:
-                await query.answer("Поиск уже завершён.", show_alert=True)
-                return
+        # Игровая логика (броски/сейвы)
+        action, g_id, turn, choice = data[0], data[1], int(data[2]), data[3]
+        game = stick_duel_games.get(g_id)
+        if not game or game["turn"] != turn: return
 
-            await query.answer()
-            cancel_search_task(search)
-            await begin_stick_game_locked(
-                context.bot,
-                search["player"],
-                stick_ai_player(),
-                [search],
-            )
-            return
+        att_idx = turn % 2
+        goal_idx = 1 - att_idx
 
-        if data.startswith("rpl_cancel:"):
-            owner_id = int(data.split(":", 1)[1])
-            if user.id != owner_id:
-                await query.answer("Отменить поиск может только его автор.", show_alert=True)
-                return
-            search = stick_duel_searches.pop(owner_id, None)
-            if not search:
-                await query.answer("Поиск уже завершён.", show_alert=True)
-                return
-
-            await query.answer()
-            cancel_search_task(search)
-            await safe_edit_search(context.bot, search, "❌ Поиск соперника отменён.")
-            return
-
-        # Игровые кнопки имеют формат:
-        # rpl_shot:<game_id>:<turn>:<zone>
-        # rpl_save:<game_id>:<turn>:<zone>
-        parts = data.split(":")
-        if len(parts) != 4:
-            await query.answer("Некорректная кнопка.", show_alert=True)
-            return
-
-        action, game_id, turn_text, choice = parts
-        game = stick_duel_games.get(game_id)
-        if not game:
-            await query.answer("Эта игра уже завершена.", show_alert=True)
-            return
-
-        try:
-            button_turn = int(turn_text)
-        except ValueError:
-            await query.answer("Некорректный ход.", show_alert=True)
-            return
-
-        if button_turn != game["turn"]:
-            await query.answer("Этот ход уже завершён.", show_alert=True)
-            return
-
-        attacker_index = game["turn"] % 2
-        goalie_index = 1 - attacker_index
-        attacker = game["players"][attacker_index]
-        goalie = game["players"][goalie_index]
-
-        if action == "rpl_shot":
-            if game["stage"] != "shot":
-                await query.answer("Сейчас не выбирают направление броска.", show_alert=True)
-                return
-            if user.id != attacker["id"]:
-                await query.answer(f"Сейчас бросает {attacker['name']}.", show_alert=True)
-                return
-            if choice not in SHOT_LABELS:
-                await query.answer("Неизвестное направление.", show_alert=True)
-                return
-
-            await query.answer("Направление выбрано!")
+        if action == "rpl_shot" and user.id == game["players"][att_idx]["id"]:
             game["shot"] = choice
             game["stage"] = "save"
-
-            header = (
-                f"Вратарь — {goalie['name']}, Нападающий — {attacker['name']}\n\n"
-                f"{attacker['name']} выбрал направление броска.\n"
-                f"Сейчас {goalie['name']} выбирает, как отбить."
-            )
-
-            if goalie["is_bot"]:
-                await send_to_stick_game(context.bot, game, header)
-                ai_save = random.choice(list(SAVE_LABELS))
-                await resolve_stick_shot_locked(context.bot, game, ai_save)
+            
+            # Повышенная сложность бота
+            if game["players"][goal_idx]["is_bot"]:
+                # 60% шанс, что бот выберет правильный сейв
+                if random.random() < 0.60:
+                    ai_choice = "home" if choice == "home" else "nines"
+                else:
+                    ai_choice = random.choice(list(SAVE_LABELS.keys()))
+                await resolve_stick_shot_locked(context.bot, game, ai_choice)
             else:
-                await send_to_stick_game(
-                    context.bot,
-                    game,
-                    header,
-                    reply_markup=stick_save_keyboard(game_id, game["turn"]),
-                )
-            return
-
-        if action == "rpl_save":
-            if game["stage"] != "save":
-                await query.answer("Сейчас не выбирают действие вратаря.", show_alert=True)
-                return
-            if user.id != goalie["id"]:
-                await query.answer(f"Сейчас отбивает {goalie['name']}.", show_alert=True)
-                return
-            if choice not in SAVE_LABELS:
-                await query.answer("Неизвестный вариант сейва.", show_alert=True)
-                return
-
-            await query.answer("Вариант сейва выбран!")
-            game["stage"] = "resolving"
+                await send_stick_turn_locked(context.bot, game)
+        
+        elif action == "rpl_save" and user.id == game["players"][goal_idx]["id"]:
             await resolve_stick_shot_locked(context.bot, game, choice)
-            return
 
-        await query.answer("Неизвестное действие.", show_alert=True)
-
-
-async def mymmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    mmr_info = get_mmr_user(user.id, user.username, user.first_name)
-    await update.message.reply_text(
-        f"📊 Твой MMR в Дуэли Клюшек: {mmr_info['mmr']}\n"
-        f"Сыграно матчей: {mmr_info['games_played']}"
-    )
-
-
-async def ratingmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    top = get_top_mmr_rating()
-    if not top:
-        await update.message.reply_text("📊 Рейтинг MMR Дуэли Клюшек пуст. Нужно сыграть хотя бы 1 матч.")
-        return
-
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    text = "🏆 **ТОП-10 ИГРОКОВ RPL (MMR Дуэли Клюшек)**\n\n"
-    for i, row in enumerate(top):
-        first_name, username, mmr, games_played = row
-        user_label = f"(@{username})" if username else ""
-        text += f"{medals[i]} {first_name}{user_label}: {mmr} MMR ({games_played} матчей)\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-# ---------- Админ-панель ----------
-async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return ConversationHandler.END
-    if is_admin(update.effective_user.id):
-        await update.message.reply_text("✅ Вы в админ-панели", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("🔑 Введите логин:")
-    return WAITING_LOGIN
-
-
-async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["login"] = update.message.text
-    await update.message.reply_text("🔒 Введите пароль:")
-    return WAITING_PASSWORD
-
-
-async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if check_credentials(context.user_data.get("login"), update.message.text):
-        add_admin(update.effective_user.id)
-        await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-    await update.message.reply_text("❌ Ошибка!")
-    return WAITING_PASSWORD
-
-
-async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return ConversationHandler.END
-    update_admin_activity(user_id)
-    text = update.message.text
-
-    if text == "➕ Добавить каналы":
-        await update.message.reply_text("Введите @username канала:")
-        return WAITING_CHANNEL_USERNAME
-    elif text == "➕ Добавить чаты":
-        await update.message.reply_text("Введите ID чата:")
-        return WAITING_CHAT_LINK
-    elif text == "📩 Проверить поддержку":
-        await show_support_messages(update, context)
-    elif text == "⚙️ Настройки":
-        await show_settings(update, context)
-    elif text == "🎮 Настройки игры":
-        await update.message.reply_text("⚙️ Выберите настройки для игры:", reply_markup=game_settings_main_keyboard())
-        return WAITING_GAME_SETTINGS
-    elif text == "🚪 Выйти":
-        remove_admin(user_id)
-        await update.message.reply_text("🚪 Вышли", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
-
-async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.text.strip()
-    if not username.startswith('@'):
-        username = '@' + username
-    try:
-        chat = await context.bot.get_chat(username)
-        add_source_channel(chat.id, username, update.effective_user.id)
-        await update.message.reply_text("✅ Добавлен", reply_markup=admin_menu_keyboard())
-    except Exception:
-        await update.message.reply_text("❌ Ошибка")
-    return ConversationHandler.END
-
-
-async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
-    try:
-        add_target_chat(int(link), link, update.effective_user.id)
-        await update.message.reply_text("✅ Добавлен", reply_markup=admin_menu_keyboard())
-    except Exception:
-        await update.message.reply_text("❌ Ошибка")
-    return ConversationHandler.END
-
-
-async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    add_support_message(user.id, user.username or str(user.id), update.message.text)
-    await update.message.reply_text("✅ Сообщение в поддержке.")
-    context.user_data.pop("in_conversation_support", None)
-    return ConversationHandler.END
-
-
-async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("in_conversation_support", None)
-    await update.message.reply_text("❌ Отмена.")
-    return ConversationHandler.END
-
-
-async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    messages = get_unanswered_messages()
-    if not messages:
-        await update.message.reply_text("📭 Пусто", reply_markup=admin_menu_keyboard())
-        return
-    m = messages[0]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{m[0]}"),
-        InlineKeyboardButton("❌ Закрыть", callback_data=f"close_{m[0]}"),
-    ]])
-    await update.message.reply_text(f"📩 #{m[0]} от {m[2]}:\n\n{m[3]}", reply_markup=kb)
-
-
-async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sources = get_source_channels()
-    targets = get_target_chats()
-    text = (
-        "📋 Настройки:\\n\\n📢 Источники:\\n"
-        + "\\n".join([f"- {s[1]}" for s in sources])
-        + "\\n\\n📥 Чаты:\\n"
-        + "\\n".join([f"- {t[1]}" for t in targets])
-    )
-    await update.message.reply_text(text, reply_markup=admin_menu_keyboard())
-
-
-async def show_bullet_duel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    gifs_goal = [get_config(f'gif_goal_{i}') for i in range(1, 4)]
-    gifs_save = [get_config(f'gif_save_{i}') for i in range(1, 4)]
-
-    text = "🎮 Настройки GIF для Дуэли Буллитов:\n\n"
-    text += "GOAL GIFs:\n"
-    for i, gif_id in enumerate(gifs_goal):
-        text += f"  {i+1}: {'Задана' if gif_id else 'Не задана'}\n"
-    text += "\nSAVE GIFs:\n"
-    for i, gif_id in enumerate(gifs_save):
-        text += f"  {i+1}: {'Задана' if gif_id else 'Не задана'}\n"
-
-    await query.edit_message_text(text, reply_markup=bullet_duel_settings_keyboard())
-    return WAITING_GIF_UPLOAD # Переводим в состояние ожидания GIF
-
-
-async def show_stick_duel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("🎮 Настройки Дуэли Клюшек:", reply_markup=stick_duel_settings_keyboard())
-    return ConversationHandler.END
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "game_settings_bullet":
-        await show_bullet_duel_settings(update, context)
-        return WAITING_GIF_UPLOAD # остаёмся в этом хэндлере, но переходим в sub-меню
-    elif data == "game_settings_stick":
-        await show_stick_duel_settings(update, context)
-        return ConversationHandler.END # Просто показываем меню и завершаем текущий ConversationHandler
-    elif data == "game_settings_back":
-        await query.edit_message_text("⚙️ Выберите настройки для игры:", reply_markup=game_settings_main_keyboard())
-        return WAITING_GAME_SETTINGS
-    elif data == "admin_back_to_main":
-        await query.edit_message_text("✅ Вы в админ-панели", reply_markup=admin_menu_keyboard())
-        return ConversationHandler.END
-    elif data.startswith("set_gif_"):
-        context.user_data["gif_type_key"] = data.replace("set_gif_", "gif_") # e.g., "gif_goal_1"
-        await query.edit_message_text("📤 Отправьте GIF:")
-        return WAITING_GIF_UPLOAD
-    elif data == "reset_bullet_rating":
-        reset_bullet_duel_ratings()
-        await query.edit_message_text("♻️ Рейтинг «Дуэли Буллитов» был успешно обнулен!", reply_markup=bullet_duel_settings_keyboard())
-        return WAITING_GIF_UPLOAD
-    elif data == "reset_stick_mmr_rating":
-        reset_stick_duel_mmr_ratings()
-        await query.edit_message_text("♻️ Рейтинг MMR «Дуэли Клюшек» был успешно обнулен!", reply_markup=stick_duel_settings_keyboard())
-        return ConversationHandler.END
-    return ConversationHandler.END
-
-
-async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_id = update.message.animation.file_id if update.message.animation else None
-    if file_id:
-        key_to_set = context.user_data.get("gif_type_key")
-        if key_to_set:
-            set_config(key_to_set, file_id)
-            await update.message.reply_text("✅ Сохранено")
-            await show_bullet_duel_settings(update, context) # Возвращаемся в меню настроек буллитов
-            return WAITING_GIF_UPLOAD
-        else:
-            await update.message.reply_text("❌ Ошибка: не удалось определить тип GIF для сохранения.")
-            return WAITING_GIF_UPLOAD
-    await update.message.reply_text("❌ Вы отправили не GIF. Попробуйте еще раз или /cancel.")
-    return WAITING_GIF_UPLOAD
-
-
-async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cp = update.channel_post
-    if not cp:
-        return
-    sources = [s[0] for s in get_source_channels()]
-    if cp.chat_id in sources:
-        targets = get_target_chats()
-        for target in targets:
-            try:
-                await cp.copy(chat_id=target[0])
-            except Exception:
-                pass
-
-
-async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    if context.user_data.get("in_conversation_support") or is_admin(update.effective_user.id):
-        return
-
-
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("regrpl", "Дуэль Клюшек — найти соперника"),
-        BotCommand("mymmr", "Мой MMR в Дуэли Клюшек"),
-        BotCommand("ratingmmr", "Топ-10 MMR игроков в Дуэли Клюшек"),
-        BotCommand("duelrpl", "Дуэль Буллитов с ИИ-вратарём"),
-        BotCommand("rating", "Топ-10 игроков лиги (Дуэль Буллитов)"),
-    ], scope=BotCommandScopeDefault())
-
-
-# ---------- MAIN ----------
+# ---------- Настройка и запуск ----------
 def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).build()
 
-    # Новая глобальная «Дуэль Клюшек»
-    app.add_handler(CommandHandler("regrpl", regrpl_command))
-    app.add_handler(CommandHandler("mymmr", mymmr_command))
-    app.add_handler(CommandHandler("ratingmmr", ratingmmr_command))
-    app.add_handler(CallbackQueryHandler(stick_duel_callback, pattern=r"^rpl_"))
-
-    # Старая система одиночной дуэли
-    app.add_handler(ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(inline_callback, pattern="^duel$"),
-            CommandHandler("duelrpl", start_duel_command),
-        ],
-        states={
-            WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")],
-        },
-        fallbacks=[CommandHandler("cancel", start)],
-        allow_reentry=True,
-    ))
-
-    # Поддержка
-    app.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
-        states={
-            WAITING_SUPPORT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive)],
-        },
-        fallbacks=[CommandHandler("cancel", support_cancel)],
-        allow_reentry=True,
-    ))
-
-    # Админка — НАСТРОЙКИ ИГР (GIF + обнуление рейтингов)
-    app.add_handler(ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^🎮 Настройки игры$"), admin_buttons),
-            CallbackQueryHandler(admin_callback, pattern="^game_settings_"),
-            CallbackQueryHandler(admin_callback, pattern="^set_gif_"),
-            CallbackQueryHandler(admin_callback, pattern="^reset_bullet_rating$"),
-            CallbackQueryHandler(admin_callback, pattern="^reset_stick_mmr_rating$"),
-            CallbackQueryHandler(admin_callback, pattern="^admin_back_to_main$"),
-        ],
-        states={
-            WAITING_GAME_SETTINGS: [CallbackQueryHandler(admin_callback, pattern="^game_settings_")],
-            WAITING_GIF_UPLOAD: [
-                MessageHandler(filters.ANIMATION | filters.Document.ALL, receive_gif),
-                CallbackQueryHandler(admin_callback, pattern="^game_settings_bullet$|^game_settings_back$|^reset_bullet_rating$"),
-                CommandHandler("cancel", adminkarpl) # для выхода из меню настроек GIF
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", adminkarpl)],
-        allow_reentry=True,
-    ))
-
-    # Авторизация администратора
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("adminkarpl", adminkarpl)],
-        states={
-            WAITING_LOGIN: [MessageHandler(filters.TEXT, wait_login)],
-            WAITING_PASSWORD: [MessageHandler(filters.TEXT, wait_password)],
-        },
-        fallbacks=[CommandHandler("cancel", start)],
-        allow_reentry=True,
-    ))
-
-    # Добавление каналов/чатов
-    app.add_handler(ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^➕ Добавить каналы$"), admin_buttons),
-            MessageHandler(filters.Regex("^➕ Добавить чаты$"), admin_buttons),
-        ],
-        states={
-            WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT, add_channel_username)],
-            WAITING_CHAT_LINK: [MessageHandler(filters.TEXT, add_chat_link)],
-        },
-        fallbacks=[CommandHandler("cancel", adminkarpl)],
-        allow_reentry=True,
-    ))
-
+    # Основные команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), main_menu))
-    app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$"), admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$"), admin_buttons))
-    app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
+    app.add_handler(CommandHandler("profile", profile_handler))
+    app.add_handler(MessageHandler(filters.Regex("^👤 Мой Профиль$"), profile_handler))
+    app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), start))
 
+    # Дуэли
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$"), CommandHandler("duelrpl", start_duel_command)],
+        states={WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")]},
+        fallbacks=[CommandHandler("cancel", start)]
+    ))
+    
+    app.add_handler(CommandHandler("regrpl", regrpl_command))
+    app.add_handler(CallbackQueryHandler(stick_duel_callback, pattern="^rpl_"))
+    app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website|support|regrpl_btn)$"))
+
+    logger.info("Бот запущен...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
