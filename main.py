@@ -25,53 +25,20 @@ if not TOKEN:
 DB_PATH = "bot_data.db"
 ADMIN_SESSION_MINUTES = 30
 
+# Состояния
 WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
 WAITING_DUEL_SHOT = 10
-WAITING_GIF_GOAL = 11
-WAITING_GIF_SAVE = 12
+WAITING_GIF_UPLOAD = 11 
 
 # ---------- БД ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS source_channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER UNIQUE,
-            username TEXT,
-            added_by INTEGER
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS target_chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER UNIQUE,
-            link TEXT,
-            added_by INTEGER
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS support_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            text TEXT,
-            timestamp TEXT,
-            answered INTEGER DEFAULT 0
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            last_activity INTEGER
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS bot_config (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
+    c.execute('''CREATE TABLE IF NOT EXISTS source_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE, username TEXT, added_by INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS target_chats (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE, link TEXT, added_by INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS support_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, text TEXT, timestamp TEXT, answered INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, last_activity INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS bot_config (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_goal', ''))
     c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_save', ''))
     conn.commit()
@@ -97,8 +64,7 @@ def set_config(key, value):
 def add_source_channel(chat_id, username, added_by):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO source_channels (chat_id, username, added_by) VALUES (?, ?, ?)',
-              (chat_id, username, added_by))
+    c.execute('INSERT OR IGNORE INTO source_channels (chat_id, username, added_by) VALUES (?, ?, ?)', (chat_id, username, added_by))
     conn.commit()
     conn.close()
 
@@ -113,8 +79,7 @@ def get_source_channels():
 def add_target_chat(chat_id, link, added_by):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO target_chats (chat_id, link, added_by) VALUES (?, ?, ?)',
-              (chat_id, link, added_by))
+    c.execute('INSERT OR IGNORE INTO target_chats (chat_id, link, added_by) VALUES (?, ?, ?)', (chat_id, link, added_by))
     conn.commit()
     conn.close()
 
@@ -129,8 +94,7 @@ def get_target_chats():
 def add_support_message(user_id, username, text):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT INTO support_messages (user_id, username, text, timestamp) VALUES (?, ?, ?, ?)',
-              (user_id, username, text, datetime.now().isoformat()))
+    c.execute('INSERT INTO support_messages (user_id, username, text, timestamp) VALUES (?, ?, ?, ?)', (user_id, username, text, datetime.now().isoformat()))
     conn.commit()
     return c.lastrowid
 
@@ -156,31 +120,23 @@ def is_admin(user_id):
     row = c.fetchone()
     conn.close()
     if row:
-        last_activity = row[0]
-        if last_activity and (datetime.now().timestamp() - last_activity) < ADMIN_SESSION_MINUTES * 60:
+        if (datetime.now().timestamp() - row[0]) < ADMIN_SESSION_MINUTES * 60:
             return True
         else:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
-            conn.commit()
-            conn.close()
-            return False
+            remove_admin(user_id) # Remove expired admin session
     return False
 
 def add_admin(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO admins (user_id, last_activity) VALUES (?, ?)',
-              (user_id, int(datetime.now().timestamp())))
+    c.execute('INSERT OR REPLACE INTO admins (user_id, last_activity) VALUES (?, ?)', (user_id, int(datetime.now().timestamp())))
     conn.commit()
     conn.close()
 
 def update_admin_activity(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('UPDATE admins SET last_activity = ? WHERE user_id = ?',
-              (int(datetime.now().timestamp()), user_id))
+    c.execute('UPDATE admins SET last_activity = ? WHERE user_id = ?', (int(datetime.now().timestamp()), user_id))
     conn.commit()
     conn.close()
 
@@ -192,10 +148,7 @@ def remove_admin(user_id):
     conn.close()
 
 def check_credentials(login, password):
-    credentials = {
-        "goyda1488": "goydarpl",
-        "rzk1488": "rzksigma",
-    }
+    credentials = {"goyda1488": "goydarpl", "rzk1488": "rzksigma"}
     return credentials.get(login) == password
 
 # ---------- Клавиатуры ----------
@@ -210,41 +163,28 @@ def admin_menu_keyboard():
     ], resize_keyboard=True)
 
 def welcome_inline_keyboard():
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Наш Discord", callback_data="discord")],
         [InlineKeyboardButton("🌐 Наш Сайт", callback_data="website")],
         [InlineKeyboardButton("🆘 Обратиться в поддержку", callback_data="support")],
         [InlineKeyboardButton("🏒 Дуэль Буллитов", callback_data="duel")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 def duel_shot_keyboard():
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🥅 Левая девятка", callback_data="shot_left")],
         [InlineKeyboardButton("🥅 Правая девятка", callback_data="shot_right")],
-        [InlineKeyboardButton("🧤 Домик (между щитков)", callback_data="shot_five")],
+        [InlineKeyboardButton("🧤 Домик", callback_data="shot_five")],
         [InlineKeyboardButton("🥅 Низ в угол", callback_data="shot_low")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
-# ---------- Основные обработчики ----------
+# ---------- Обработчики ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Добро пожаловать в **Russian Puck League**!\n"
-        "Выберите действие с помощью кнопок ниже.",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
-    )
-    await update.message.reply_text(
-        "📌 Выберите раздел:",
-        reply_markup=welcome_inline_keyboard()
-    )
+    await update.message.reply_text("👋 Добро пожаловать в Russian Puck League!", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📌 Выберите раздел:",
-        reply_markup=welcome_inline_keyboard()
-    )
+    await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -252,82 +192,70 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "discord":
-        await query.edit_message_text(
-            "💬 **Discord Server RPL:** https://discord.gg/dgkFMCgDwx",
-            parse_mode="Markdown"
-        )
-        await query.message.reply_text(
-            "📌 Выберите другой раздел:",
-            reply_markup=welcome_inline_keyboard()
-        )
+        await query.edit_message_text("💬 Discord Server RPL: https://discord.gg/dgkFMCgDwx")
+        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
     elif data == "website":
-        await query.edit_message_text(
-            "🌐 **Сайт Russian Puck League:** rplpuck.ru",
-            parse_mode="Markdown"
-        )
-        await query.message.reply_text(
-            "📌 Выберите другой раздел:",
-            reply_markup=welcome_inline_keyboard()
-        )
+        await query.edit_message_text("🌐 Сайт Russian Puck League: rplpuck.ru")
+        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
     elif data == "support":
-        context.user_data["in_conversation"] = True
-        await query.edit_message_text(
-            "✍️ Напишите ваше сообщение для поддержки.\n"
-            "Мы ответим вам как можно скорее.\n\n"
-            "Для отмены отправьте /cancel"
-        )
+        context.user_data["in_conversation_support"] = True # Use specific flag for support
+        await query.edit_message_text("✍️ Напишите сообщение поддержке или /cancel")
         return WAITING_SUPPORT_MSG
     elif data == "duel":
-        context.user_data["in_conversation"] = True
-        await query.edit_message_text(
-            "🏒 **Дуэль Буллитов!**\n"
-            "Выбери зону для броска:",
-            parse_mode="Markdown",
+        # Duel is now handled by conv_duel entry point
+        # This will still trigger conv_duel, but `start_duel_command` is more direct
+        await query.edit_message_text("🏒 Дуэль Буллитов! Выбери зону:", reply_markup=duel_shot_keyboard())
+        return WAITING_DUEL_SHOT
+
+async def start_duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает игру "Дуэль Буллитов" по команде /duelrpl."""
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("🏒 Дуэль Буллитов! Выбери зону:", reply_markup=duel_shot_keyboard())
+    else: # For group chats
+        # Use user_data specific to the user for this conversation in a group
+        context.user_data[f"in_duel_{update.effective_user.id}"] = True
+        await update.message.reply_text(
+            f"🏒 {update.effective_user.first_name}, твоя очередь в Дуэли Буллитов! Выбери зону:",
             reply_markup=duel_shot_keyboard()
         )
-        return WAITING_DUEL_SHOT
-    return ConversationHandler.END
+    return WAITING_DUEL_SHOT
 
 async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     shot_zone = query.data
 
-    goalie_zones = ["shot_left", "shot_right", "shot_five", "shot_low"]
-    goalie_choice = random.choice(goalie_zones)
-    scored = random.random() < 0.35
-
-    if shot_zone == goalie_choice:
-        scored = False
+    goalie_choice = random.choice(["shot_left", "shot_right", "shot_five", "shot_low"])
+    scored = random.random() < 0.35 if shot_zone != goalie_choice else False
 
     if scored:
-        gif = get_config('gif_goal')
-        result_text = "⚡ **ГОЛ!** Вы точно попали в девятку!"
-        if not gif:
-            gif = "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"
+        gif = get_config('gif_goal') or "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"
+        result_text = "⚡️ ГОЛ! Вы точно попали в девятку!"
     else:
-        gif = get_config('gif_save')
-        result_text = "🧤 **СЕЙВ!** Вратарь отразил бросок!"
-        if not gif:
-            gif = "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"
+        gif = get_config('gif_save') or "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"
+        result_text = "🧤 СЕЙВ! Вратарь отразил бросок!"
 
+    # Edit the original message (button message) to show the result
     await query.edit_message_text(
-        f"{result_text}\n\n"
-        f"Ваш бросок: **{shot_zone.replace('shot_', '').capitalize()}**\n"
-        f"Вратарь выбрал: **{goalie_choice.replace('shot_', '').capitalize()}**",
-        parse_mode="Markdown"
+        f"{result_text}\n"
+        f"Ваш бросок: {shot_zone.replace('shot_', '').capitalize()}\n"
+        f"Вратарь выбрал: {goalie_choice.replace('shot_', '').capitalize()}"
     )
+    
     try:
         await query.message.reply_animation(gif)
     except Exception as e:
-        await query.message.reply_text("❌ Не удалось отправить GIF. Проверьте настройки.")
-        logger.error(f"Ошибка отправки GIF: {e}")
+        logger.error(f"Ошибка отправки GIF в дуэли: {e}")
+        await query.message.reply_text(f"❌ Не удалось отправить GIF. Проверьте настройки. Ошибка: {e}")
 
-    await query.message.reply_text(
-        "📌 Выберите другой раздел:",
-        reply_markup=welcome_inline_keyboard()
-    )
-    context.user_data["in_conversation"] = False
+    # Remove the duel state for the user
+    if update.effective_chat.type != "private":
+        context.user_data.pop(f"in_duel_{update.effective_user.id}", None)
+
+    # For private chat, offer main menu again
+    if update.effective_chat.type == "private":
+        await query.message.reply_text("📌 Выберите другой раздел:", reply_markup=welcome_inline_keyboard())
+    
     return ConversationHandler.END
 
 async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,66 +291,62 @@ async def support_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Нет активных администраторов. Сообщение сохранено.")
 
     await update.message.reply_text("✅ Сообщение отправлено в поддержку.")
-    context.user_data["in_conversation"] = False
-    await update.message.reply_text(
-        "📌 Выберите раздел:",
-        reply_markup=welcome_inline_keyboard()
-    )
+    context.user_data.pop("in_conversation_support", None) # Clear support flag
+    await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
     return ConversationHandler.END
 
 async def support_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["in_conversation"] = False
+    context.user_data.pop("in_conversation_support", None) # Clear support flag
     await update.message.reply_text("❌ Отправка отменена.")
-    await update.message.reply_text(
-        "📌 Выберите раздел:",
-        reply_markup=welcome_inline_keyboard()
-    )
+    await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
     return ConversationHandler.END
 
+# ---------- Админ-панель ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Команда только в личных сообщениях.")
         return ConversationHandler.END
-    context.user_data["in_conversation"] = True
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("Вы уже авторизованы.", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+    context.user_data["admin_login_in_progress"] = True # Use specific flag for admin login
     await update.message.reply_text("🔑 Введите логин:")
     return WAITING_LOGIN
 
 async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["in_conversation"] = True
     context.user_data["login"] = update.message.text
     await update.message.reply_text("🔒 Введите пароль:")
     return WAITING_PASSWORD
 
 async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["in_conversation"] = True
     login = context.user_data.get("login")
     password = update.message.text
     if check_credentials(login, password):
         add_admin(update.effective_user.id)
-        context.user_data["in_conversation"] = False
+        context.user_data.pop("login", None)
+        context.user_data.pop("admin_login_in_progress", None)
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
     else:
         await update.message.reply_text("❌ Неверный логин или пароль. Попробуйте /adminkarpl")
         return WAITING_PASSWORD
 
-# ---------- Админ-панель (исправлена) ----------
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ Сессия истекла. Авторизуйтесь через /adminkarpl.")
+        await update.message.reply_text("⛔️ Сессия истекла. Авторизуйтесь через /adminkarpl.")
         await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
-        return
+        return ConversationHandler.END # End current conversation if admin session expired
 
     update_admin_activity(user_id)
 
     text = update.message.text
     if text == "➕ Добавить каналы":
-        context.user_data["in_conversation"] = True
+        context.user_data["admin_action"] = "add_channel"
         await update.message.reply_text("Введите @username канала (бот должен быть админом):")
         return WAITING_CHANNEL_USERNAME
     elif text == "➕ Добавить чаты":
-        context.user_data["in_conversation"] = True
+        context.user_data["admin_action"] = "add_chat"
         await update.message.reply_text(
             "Введите числовой ID чата или @username.\n"
             "Бот должен состоять в чате.\n"
@@ -431,28 +355,21 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_CHAT_LINK
     elif text == "📩 Проверить поддержку":
         await show_support_messages(update, context)
-        return
+        return ConversationHandler.END # End here, next interaction is from inline buttons
     elif text == "⚙️ Настройки":
         await show_settings(update, context)
-        return
+        return ConversationHandler.END # End here
     elif text == "🎮 Настройки игры":
-        # Принудительно сбрасываем все состояния
-        context.user_data["in_conversation"] = False
-        context.user_data.pop("reply_to", None)
-        context.user_data.pop("gif_type", None)
-        # Показываем настройки игры
         await show_game_settings(update, context)
-        # Явно завершаем любой активный диалог
-        return ConversationHandler.END
+        return ConversationHandler.END # End here, next interaction is from inline buttons
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вы вышли из админ-панели.", reply_markup=main_menu_keyboard())
         await update.message.reply_text("📌 Выберите раздел:", reply_markup=welcome_inline_keyboard())
-        return
+        return ConversationHandler.END
     else:
         await update.message.reply_text("Используйте кнопки меню.", reply_markup=admin_menu_keyboard())
-        return
-    return ConversationHandler.END
+        return ConversationHandler.END # End on unknown text
 
 # ---------- Добавление канала / чата ----------
 async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,13 +382,12 @@ async def add_channel_username(update: Update, context: ContextTypes.DEFAULT_TYP
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['administrator', 'creator']:
             await update.message.reply_text("❌ Бот не администратор.")
-            context.user_data["in_conversation"] = False
             return ConversationHandler.END
         add_source_channel(chat_id, username, update.effective_user.id)
         await update.message.reply_text(f"✅ Канал {username} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
-    context.user_data["in_conversation"] = False
+    context.user_data.pop("admin_action", None)
     return ConversationHandler.END
 
 async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,7 +405,6 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username = '@' + candidate
             else:
                 await update.message.reply_text("❌ Приватная ссылка не поддерживается. Используйте ID.")
-                context.user_data["in_conversation"] = False
                 return ConversationHandler.END
     else:
         try:
@@ -505,27 +420,25 @@ async def add_chat_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat = await context.bot.get_chat(chat_id)
         else:
             await update.message.reply_text("❌ Неверный формат.")
-            context.user_data["in_conversation"] = False
             return ConversationHandler.END
 
         bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
         if bot_member.status not in ['member', 'administrator', 'creator']:
             await update.message.reply_text("❌ Бот не состоит в чате.")
-            context.user_data["in_conversation"] = False
             return ConversationHandler.END
 
         add_target_chat(chat_id, link, update.effective_user.id)
         await update.message.reply_text(f"✅ Чат {link} добавлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
-    context.user_data["in_conversation"] = False
+    context.user_data.pop("admin_action", None)
     return ConversationHandler.END
 
 # ---------- Просмотр поддержки и настроек ----------
 async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = get_unanswered_messages()
     if not messages:
-        await update.message.reply_text("📭 Новых обращений нет.", reply_markup=admin_menu_keyboard())
+        await update.effective_message.reply_text("📭 Новых обращений нет.", reply_markup=admin_menu_keyboard())
         return
     msg = messages[0]
     msg_id, user_id, username, text, timestamp = msg
@@ -541,7 +454,7 @@ async def show_support_messages(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("⏩ Следующее", callback_data="next_support")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
     ])
-    await update.message.reply_text(display_text, reply_markup=keyboard)
+    await update.effective_message.reply_text(display_text, reply_markup=keyboard)
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sources = get_source_channels()
@@ -558,74 +471,52 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"  - {link or chat_id} (ID: {chat_id})\n"
     else:
         text += "  (нет)\n"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
-# ---------- Настройки игры (исправлены) ----------
+# ---------- Настройки игры ----------
 async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает настройки игры, сбрасывая все состояния."""
-    # Сбрасываем флаги и временные данные
-    context.user_data["in_conversation"] = False
-    context.user_data.pop("reply_to", None)
-    context.user_data.pop("gif_type", None)
-
     goal_gif = get_config('gif_goal') or 'не установлен'
     save_gif = get_config('gif_save') or 'не установлен'
+    
+    # Trim file_id for display purposes
+    goal_gif_display = goal_gif[:20] + '...' if len(goal_gif) > 20 else goal_gif
+    save_gif_display = save_gif[:20] + '...' if len(save_gif) > 20 else save_gif
+
     text = (
         "🎮 **Настройки игры «Дуэль Буллитов»**\n\n"
-        f"⚡ **GIF гола:** {goal_gif}\n"
-        f"🧤 **GIF сейва:** {save_gif}\n\n"
+        f"⚡️ **GIF гола:** `{goal_gif_display}`\n"
+        f"🧤 **GIF сейва:** `{save_gif_display}`\n\n"
         "Выберите действие:"
     )
+    
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Изменить GIF гола", callback_data="change_goal_gif")],
-        [InlineKeyboardButton("🔄 Изменить GIF сейва", callback_data="change_save_gif")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
+        [InlineKeyboardButton("👁 Чекнуть GOAL", callback_data="view_goal_gif"),
+         InlineKeyboardButton("👁 Чекнуть SAVE", callback_data="view_save_gif")],
+        [InlineKeyboardButton("🔄 Изменить GOAL", callback_data="set_goal"),
+         InlineKeyboardButton("🔄 Изменить SAVE", callback_data="set_save")],
+        [InlineKeyboardButton("🔙 Назад в админку", callback_data="back_to_admin")]
     ])
-    # Если вызвано из callback – редактируем, иначе отправляем новое
+
     if update.callback_query:
         await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        await update.callback_query.answer()
     else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
-async def change_gif_start(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
+async def view_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
     query = update.callback_query
     await query.answer()
-    context.user_data["gif_type"] = gif_type
-    context.user_data["in_conversation"] = True
-    await query.edit_message_text(
-        f"📤 Отправьте **GIF-файл** для {'гола' if gif_type == 'goal' else 'сейва'}.\n"
-        "Просто перешлите GIF или загрузите файл.\n"
-        "Для отмены отправьте /cancel"
-    )
-    if gif_type == 'goal':
-        return WAITING_GIF_GOAL
+    gif = get_config('gif_goal' if gif_type == 'goal' else 'gif_save')
+    if gif:
+        try:
+            await query.message.reply_animation(gif)
+        except Exception as e:
+            await query.message.reply_text(f"❌ Не удалось отправить GIF. Возможно, файл устарел или ID неверный. Ошибка: {e}")
+            logger.error(f"Ошибка отправки GIF при просмотре ({gif_type}): {e}")
     else:
-        return WAITING_GIF_SAVE
+        await query.message.reply_text("❌ GIF не установлен. Установите его через 'Изменить'.")
+    # Remain in game settings view
+    # await show_game_settings(update, context) # No need to re-send the whole menu
 
-async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE, gif_type):
-    message = update.message
-    file_id = None
-    if message.animation:
-        file_id = message.animation.file_id
-    elif message.document and message.document.mime_type and 'gif' in message.document.mime_type:
-        file_id = message.document.file_id
-    else:
-        await update.message.reply_text("❌ Пожалуйста, отправьте GIF-файл (анимацию или документ).")
-        return WAITING_GIF_GOAL if gif_type == 'goal' else WAITING_GIF_SAVE
-
-    if file_id:
-        key = 'gif_goal' if gif_type == 'goal' else 'gif_save'
-        set_config(key, file_id)
-        await update.message.reply_text("✅ GIF сохранён!", reply_markup=admin_menu_keyboard())
-        # Показываем обновлённые настройки игры
-        await show_game_settings(update, context)
-    else:
-        await update.message.reply_text("❌ Не удалось получить file_id. Попробуйте ещё раз.")
-    context.user_data["in_conversation"] = False
-    return ConversationHandler.END
-
-# ---------- Инлайн-колбэки для админа ----------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -633,15 +524,68 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if not is_admin(user_id):
-        await query.edit_message_text("⛔ Сессия истекла. Авторизуйтесь заново.")
-        return
+        await query.edit_message_text("⛔️ Сессия истекла.")
+        return ConversationHandler.END
+
+    update_admin_activity(user_id)
+
+    if data in ["set_goal", "set_save"]:
+        context.user_data["gif_type"] = "gif_goal" if data == "set_goal" else "gif_save"
+        await query.edit_message_text(f"📤 Отправьте GIF для **{'ГОЛА' if data == 'set_goal' else 'СЕЙВА'}** (или /cancel):")
+        return WAITING_GIF_UPLOAD
+    
+    elif data == "back_to_admin":
+        # Edit the message to remove inline buttons and then send the main admin menu
+        await query.edit_message_text("🔙 Возврат в главное админ-меню.")
+        await query.message.reply_text("Выберите раздел:", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END # End the game settings conversation
+
+    elif data == "view_goal_gif":
+        await view_gif(update, context, 'goal')
+    elif data == "view_save_gif":
+        await view_gif(update, context, 'save')
+
+    return ConversationHandler.END # End here for other admin inline callbacks too
+
+async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_id = None
+    if update.message.animation:
+        file_id = update.message.animation.file_id
+    elif update.message.document and update.message.document.mime_type and 'gif' in update.message.document.mime_type:
+        file_id = update.message.document.file_id
+    
+    if file_id:
+        key = context.user_data.get("gif_type")
+        if key:
+            set_config(key, file_id)
+            await update.message.reply_text("✅ GIF сохранён!")
+        else:
+            await update.message.reply_text("❌ Неизвестный тип GIF для сохранения.")
+        
+        # Clear temporary data and return to game settings
+        context.user_data.pop("gif_type", None) 
+        await show_game_settings(update, context) # Show settings again
+        return ConversationHandler.END # Crucial to end the conversation
+    
+    await update.message.reply_text("❌ Пожалуйста, отправьте именно GIF-файл (анимацию или документ).")
+    return WAITING_GIF_UPLOAD # Stay in this state if not a GIF
+
+# ---------- Инлайн-колбэки для админа (для поддержки) ----------
+async def admin_callback_for_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        await query.edit_message_text("⛔️ Сессия истекла.")
+        return ConversationHandler.END
 
     update_admin_activity(user_id)
 
     if data.startswith("reply_"):
         msg_id = int(data.split("_")[1])
         context.user_data["reply_to"] = msg_id
-        context.user_data["in_conversation"] = True
         await query.edit_message_text("✏️ Введите текст ответа (в личку боту):")
         return WAITING_REPLY_TEXT
     elif data.startswith("close_"):
@@ -650,45 +594,25 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Обращение закрыто.")
         messages = get_unanswered_messages()
         if messages:
-            await show_support_messages(update, context)
+            # Recursively call show_support_messages to display next
+            await show_support_messages(update, context) 
         else:
             await query.message.reply_text("📭 Больше нет обращений.", reply_markup=admin_menu_keyboard())
     elif data == "next_support":
+        # Delete previous support message and show the next one
         await query.message.delete()
-        messages = get_unanswered_messages()
-        if messages:
-            msg = messages[0]
-            msg_id, user_id, username, text, timestamp = msg
-            display_text = (
-                f"📩 Обращение #{msg_id}\n"
-                f"👤 {username or user_id}\n"
-                f"🕒 {timestamp}\n\n"
-                f"{text}"
-            )
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{msg_id}")],
-                [InlineKeyboardButton("✅ Закрыть", callback_data=f"close_{msg_id}")],
-                [InlineKeyboardButton("⏩ Следующее", callback_data="next_support")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin")]
-            ])
-            await query.message.reply_text(display_text, reply_markup=keyboard)
-        else:
-            await query.message.reply_text("📭 Больше нет обращений.", reply_markup=admin_menu_keyboard())
+        await show_support_messages(update, context)
     elif data == "back_to_admin":
         await query.message.delete()
         await query.message.reply_text("🔙 Возврат в админ-панель.", reply_markup=admin_menu_keyboard())
-    elif data == "change_goal_gif":
-        return await change_gif_start(update, context, 'goal')
-    elif data == "change_save_gif":
-        return await change_gif_start(update, context, 'save')
     return ConversationHandler.END
+
 
 async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text = update.message.text
     msg_id = context.user_data.get("reply_to")
     if not msg_id:
         await update.message.reply_text("❌ Нет обращения для ответа.")
-        context.user_data["in_conversation"] = False
         return ConversationHandler.END
 
     conn = sqlite3.connect(DB_PATH)
@@ -698,7 +622,6 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     if not row:
         await update.message.reply_text("❌ Обращение не найдено.")
-        context.user_data["in_conversation"] = False
         return ConversationHandler.END
 
     user_id = row[0]
@@ -708,7 +631,7 @@ async def reply_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Ответ отправлен.", reply_markup=admin_menu_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка отправки: {e}")
-    context.user_data["in_conversation"] = False
+    context.user_data.pop("reply_to", None)
     return ConversationHandler.END
 
 # ---------- Пересылка из каналов ----------
@@ -723,6 +646,7 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = channel_post.text or channel_post.caption or ""
+    # Only forward if post contains one of these tags
     if not any(tag in text for tag in ["#MatchDay", "#Results", "#rplpuck"]):
         return
 
@@ -736,28 +660,34 @@ async def forward_from_channels(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---------- Автоудаление неизвестных сообщений ----------
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Do not process messages in groups if it's not a duel in progress for that user
     if update.effective_chat.type != "private":
-        return
-    if update.message.text and update.message.text.startswith('/'):
-        return
-    if context.user_data.get("in_conversation", False):
-        return
-    if context.user_data.get("login"):
-        return
+        user_id = update.effective_user.id
+        if not context.user_data.get(f"in_duel_{user_id}", False):
+            return
+        # If it's a duel and not a callback, do not delete, just ignore
+        if update.message:
+            return
 
-    text = update.message.text
-    if text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", 
-                "📩 Проверить поддержку", "⚙️ Настройки", "🎮 Настройки игры", "🚪 Выйти"]:
-        return
+    # Check for private messages not part of any ongoing conversation
+    if (update.effective_chat.type == "private" and 
+        not context.user_data.get("admin_login_in_progress", False) and
+        not context.user_data.get("in_conversation_support", False) and
+        context.user_data.get("in_duel_private", False) # Check for private duel
+    ):
+        # Ignore main menu text and admin menu text
+        if update.message.text in ["🏠 Главное меню", "➕ Добавить каналы", "➕ Добавить чаты", 
+                                "📩 Проверить поддержку", "⚙️ Настройки", "🎮 Настройки игры", "🚪 Выйти"]:
+            return
 
-    try:
-        user_msg = update.message
-        error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса. Попробуйте снова.")
-        await asyncio.sleep(3)
-        await user_msg.delete()
-        await error_msg.delete()
-    except Exception as e:
-        logger.error(f"Ошибка удаления: {e}")
+        try:
+            user_msg = update.message
+            error_msg = await update.message.reply_text("❌ Ошибка! Не выбран модуль запроса. Попробуйте снова.")
+            await asyncio.sleep(3) # Give user time to read
+            await user_msg.delete()
+            await error_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка удаления: {e}")
 
 async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -774,7 +704,7 @@ def main():
             WAITING_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_login)],
             WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[CommandHandler("cancel", lambda u, c: start(u, c))], # Return to start on cancel
         allow_reentry=True,
     )
     app.add_handler(conv_auth)
@@ -785,7 +715,7 @@ def main():
         states={
             WAITING_CHANNEL_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_username)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[CommandHandler("cancel", lambda u, c: admin_buttons(u,c, "back_to_admin_menu"))], # Use admin_buttons to return
         allow_reentry=True,
     )
     app.add_handler(conv_channel)
@@ -796,23 +726,23 @@ def main():
         states={
             WAITING_CHAT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_chat_link)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[CommandHandler("cancel", lambda u, c: admin_buttons(u,c, "back_to_admin_menu"))],
         allow_reentry=True,
     )
     app.add_handler(conv_chat)
 
-    # Диалог ответа на обращение
+    # Диалог ответа на обращение (через админку)
     conv_reply = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^reply_")],
+        entry_points=[CallbackQueryHandler(admin_callback_for_support, pattern="^reply_")],
         states={
             WAITING_REPLY_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reply_to_support)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[CommandHandler("cancel", lambda u, c: admin_callback_for_support(u,c, "back_to_admin_menu"))], # Need to handle back
         allow_reentry=True,
     )
     app.add_handler(conv_reply)
 
-    # Диалог поддержки
+    # Диалог поддержки (для пользователя)
     conv_support = ConversationHandler(
         entry_points=[CallbackQueryHandler(inline_callback, pattern="^support$")],
         states={
@@ -823,63 +753,54 @@ def main():
     )
     app.add_handler(conv_support)
 
-    # Диалог игры
+    # Диалог игры "Дуэль Буллитов" (теперь с командой /duelrpl)
     conv_duel = ConversationHandler(
-        entry_points=[CallbackQueryHandler(inline_callback, pattern="^duel$")],
+        entry_points=[
+            CallbackQueryHandler(inline_callback, pattern="^duel$"), # From inline menu
+            CommandHandler("duelrpl", start_duel_command, filters=filters.ChatType.GROUPS | filters.ChatType.PRIVATE) # From command in groups or private
+        ],
         states={
             WAITING_DUEL_SHOT: [CallbackQueryHandler(duel_shot, pattern="^shot_")],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Игра отменена."))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Игра отменена."), filters=filters.ChatType.PRIVATE)], # Only private chat cancel
         allow_reentry=True,
     )
     app.add_handler(conv_duel)
 
-    # Диалог изменения GIF гола
-    conv_gif_goal = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_goal_gif$")],
+    # Диалог изменения GIF (Настройки игры)
+    conv_gif_settings = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^🎮 Настройки игры$") & filters.ChatType.PRIVATE, admin_buttons),
+            CallbackQueryHandler(admin_callback, pattern="^(set_goal|set_save|view_goal_gif|view_save_gif|back_to_admin)$")
+        ],
         states={
-            WAITING_GIF_GOAL: [MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'goal'))],
+            WAITING_GIF_UPLOAD: [MessageHandler(filters.ANIMATION | filters.Document.ALL, receive_gif)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
+        fallbacks=[CommandHandler("cancel", lambda u,c: admin_buttons(u,c, "back_to_admin_menu"))],
         allow_reentry=True,
     )
-    app.add_handler(conv_gif_goal)
+    app.add_handler(conv_gif_settings)
 
-    # Диалог изменения GIF сейва
-    conv_gif_save = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^change_save_gif$")],
-        states={
-            WAITING_GIF_SAVE: [MessageHandler(filters.ANIMATION | filters.Document.ALL, lambda u,c: receive_gif(u,c,'save'))],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_gif_save)
-
-    # Обработчики кнопок админ-меню (без диалогов)
+    # Обработчики кнопок админ-меню (без диалогов, где нет состояний)
     app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$") & filters.ChatType.PRIVATE, admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🎮 Настройки игры$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$") & filters.ChatType.PRIVATE, admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$") & filters.ChatType.PRIVATE, main_menu))
 
     # Inline-колбэки главного меню
     app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
-
-    # Inline-колбэки админа
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(close_|next_support|back_to_admin)$"))
-
+    
     # Пересылка из каналов
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
-
-    # Автоудаление неизвестных сообщений
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=999)
 
     # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("getid", getid))
-    app.add_handler(CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено.")))
+    app.add_handler(CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))) # Global cancel
 
+    # Автоудаление неизвестных сообщений - ГРУППА 1, чтобы сработал после ConversationHandlers
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_unknown_message), group=1)
+    
     logger.info("Бот запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
