@@ -38,10 +38,13 @@ ADMIN_SESSION_MINUTES = 30
 WAITING_LOGIN, WAITING_PASSWORD, WAITING_CHANNEL_USERNAME, WAITING_CHAT_LINK, WAITING_REPLY_TEXT, WAITING_SUPPORT_MSG = range(6)
 WAITING_DUEL_SHOT = 10
 WAITING_GIF_UPLOAD = 11
+WAITING_GAME_SETTINGS = 12
 
 # Настройки «Дуэли Клюшек»
 STICK_DUEL_SEARCH_SECONDS = 45
 STICK_DUEL_TOTAL_TURNS = 6  # По 3 буллита каждому
+INITIAL_MMR = 1000
+K_FACTOR = 32 # Коэффициент изменения MMR
 
 # Глобальная очередь позволяет находить игроков даже в разных чатах.
 # Состояние игр хранится в памяти и сбрасывается при перезапуске бота.
@@ -100,9 +103,18 @@ def init_db():
         total_shots INTEGER DEFAULT 0,
         goals INTEGER DEFAULT 0
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS mmr_stats (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        mmr INTEGER DEFAULT 1000,
+        games_played INTEGER DEFAULT 0
+    )''')
 
-    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_goal', ''))
-    c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', ('gif_save', ''))
+    # Инициализация GIF конфигов
+    for i in range(1, 4):
+        c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', (f'gif_goal_{i}', ''))
+        c.execute('INSERT OR IGNORE INTO bot_config (key, value) VALUES (?, ?)', (f'gif_save_{i}', ''))
     conn.commit()
     conn.close()
 
@@ -139,7 +151,7 @@ def get_top_rating():
     return rows
 
 
-def reset_all_ratings():
+def reset_bullet_duel_ratings():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM duel_stats')
@@ -164,8 +176,21 @@ def set_config(key, value):
     conn.close()
 
 
-def add_source_channel(chat_id, username, added_by):
+def get_all_gifs(prefix):
     conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    gifs = []
+    for i in range(1, 4):
+        c.execute('SELECT value FROM bot_config WHERE key = ?', (f'{prefix}_{i}',))
+        row = c.fetchone()
+        if row and row[0]:
+            gifs.append(row[0])
+    conn.close()
+    return gifs if gifs else None
+
+
+def add_source_channel(chat_id, username, added_by):
+    conn = sqlite3(DB_PATH)
     c = conn.cursor()
     c.execute('INSERT OR IGNORE INTO source_channels (chat_id, username, added_by) VALUES (?, ?, ?)',
               (chat_id, username, added_by))
@@ -272,6 +297,88 @@ def check_credentials(login, password):
     return credentials.get(login) == password
 
 
+# ---------- MMR функции ----------
+def get_mmr_user(user_id, username, first_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT mmr, games_played FROM mmr_stats WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    if row:
+        mmr, games_played = row
+    else:
+        # Создаем запись, если пользователь не найден
+        mmr, games_played = INITIAL_MMR, 0
+        c.execute('INSERT INTO mmr_stats (user_id, username, first_name, mmr, games_played) VALUES (?, ?, ?, ?, ?)',
+                  (user_id, username, first_name, mmr, games_played))
+        conn.commit()
+    conn.close()
+    return {"mmr": mmr, "games_played": games_played}
+
+
+def update_mmr(user_id, username, first_name, mmr_change):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('INSERT INTO mmr_stats (user_id, username, first_name, mmr, games_played) VALUES (?, ?, ?, ?, ?)\n'
+              'ON CONFLICT(user_id) DO UPDATE SET\n'
+              'username = excluded.username,\n'
+              'first_name = excluded.first_name,\n'
+              'mmr = mmr + ?,\n'
+              'games_played = games_played + 1',
+              (user_id, username, first_name, INITIAL_MMR, 1, mmr_change))
+    conn.commit()
+    conn.close()
+
+
+def calculate_elo_change(player_mmr, opponent_mmr, won):
+    """Рассчитывает изменение MMR по формуле Эло."""
+    expected_score = 1 / (1 + 10 ** ((opponent_mmr - player_mmr) / 400))
+    actual_score = 1 if won else 0
+    return round(K_FACTOR * (actual_score - expected_score))
+
+
+def update_stick_duel_mmr_stats(winner_player_data, loser_player_data):
+    winner_id = winner_player_data["id"]
+    winner_username = winner_player_data.get("username")
+    winner_name = winner_player_data["name"]
+
+    loser_id = loser_player_data["id"]
+    loser_username = loser_player_data.get("username")
+    loser_name = loser_player_data["name"]
+
+    # ИИ не участвует в MMR
+    if winner_player_data["is_bot"] or loser_player_data["is_bot"]:
+        return
+
+    winner_current_mmr = get_mmr_user(winner_id, winner_username, winner_name)["mmr"]
+    loser_current_mmr = get_mmr_user(loser_id, loser_username, loser_name)["mmr"]
+
+    winner_mmr_change = calculate_elo_change(winner_current_mmr, loser_current_mmr, True)
+    loser_mmr_change = calculate_elo_change(loser_current_mmr, winner_current_mmr, False)
+
+    update_mmr(winner_id, winner_username, winner_name, winner_mmr_change)
+    update_mmr(loser_id, loser_username, loser_name, loser_mmr_change)
+
+
+def get_top_mmr_rating():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''SELECT first_name, username, mmr, games_played
+                 FROM mmr_stats
+                 WHERE games_played > 0
+                 ORDER BY mmr DESC LIMIT 10''')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def reset_stick_duel_mmr_ratings():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM mmr_stats')
+    conn.commit()
+    conn.close()
+
+
 # ---------- Клавиатуры ----------
 def main_menu_keyboard():
     return ReplyKeyboardMarkup([["🏠 Главное меню"]], resize_keyboard=True)
@@ -281,8 +388,7 @@ def admin_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["➕ Добавить каналы", "➕ Добавить чаты"],
         ["📩 Проверить поддержку", "⚙️ Настройки"],
-        ["🎮 Настройки игры", "🧹 Обнулить рейтинг"],
-        ["🚪 Выйти"],
+        ["🎮 Настройки игры", "🚪 Выйти"], # Убрано "🧹 Обнулить рейтинг"
     ], resize_keyboard=True)
 
 
@@ -324,6 +430,35 @@ def stick_save_keyboard(game_id, turn):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Девятки", callback_data=f"rpl_save:{game_id}:{turn}:nines")],
         [InlineKeyboardButton("Домик", callback_data=f"rpl_save:{game_id}:{turn}:home")],
+    ])
+
+def game_settings_main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Настройки Дуэли Буллитов", callback_data="game_settings_bullet")],
+        [InlineKeyboardButton("Настройки Дуэли Клюшек", callback_data="game_settings_stick")],
+        [InlineKeyboardButton("⬅️ Назад в Админ-панель", callback_data="admin_back_to_main")],
+    ])
+
+def bullet_duel_settings_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("GOAL GIF 1", callback_data="set_gif_goal_1"),
+            InlineKeyboardButton("GOAL GIF 2", callback_data="set_gif_goal_2"),
+            InlineKeyboardButton("GOAL GIF 3", callback_data="set_gif_goal_3"),
+        ],
+        [
+            InlineKeyboardButton("SAVE GIF 1", callback_data="set_gif_save_1"),
+            InlineKeyboardButton("SAVE GIF 2", callback_data="set_gif_save_2"),
+            InlineKeyboardButton("SAVE GIF 3", callback_data="set_gif_save_3"),
+        ],
+        [InlineKeyboardButton("♻️ Обнулить рейтинг «Дуэли Буллитов»", callback_data="reset_bullet_rating")],
+        [InlineKeyboardButton("⬅️ Назад в Настройки игр", callback_data="game_settings_back")],
+    ])
+
+def stick_duel_settings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Обнулить рейтинг MMR «Дуэли Клюшек»", callback_data="reset_stick_mmr_rating")],
+        [InlineKeyboardButton("⬅️ Назад в Настройки игр", callback_data="game_settings_back")],
     ])
 
 
@@ -374,11 +509,11 @@ async def start_duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def rating_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = get_top_rating()
     if not top:
-        await update.message.reply_text("📊 Рейтинг пуст. Нужно минимум 7 бросков для попадания в ТОП!")
+        await update.message.reply_text("📊 Рейтинг Дуэли Буллитов пуст. Нужно минимум 7 бросков для попадания в ТОП!")
         return
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    text = "🏆 **ТОП-10 ИГРОКОВ RPL**\n\n"
+    text = "🏆 **ТОП-10 ИГРОКОВ RPL (Дуэль Буллитов)**\n\n"
     for i, row in enumerate(top):
         first_name, username, goals, total, percent = row
         user_label = f"(@{username})" if username else ""
@@ -400,10 +535,12 @@ async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_duel_stats(user.id, user.username, user.first_name, scored)
 
     if scored:
-        gif = get_config('gif_goal') or "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"
+        gifs = get_all_gifs('gif_goal')
+        gif = random.choice(gifs) if gifs else "https://media.giphy.com/media/3o7aTskHEUdgCQAXde/giphy.gif"
         result_text = "⚡️ **ГОЛ!** Вы точно попали в девятку!"
     else:
-        gif = get_config('gif_save') or "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"
+        gifs = get_all_gifs('gif_save')
+        gif = random.choice(gifs) if gifs else "https://media.giphy.com/media/3o6Ztq5cG6GZj5F9uo/giphy.gif"
         result_text = "🧤 **СЕЙВ!** Вратарь отразил бросок!"
 
     await query.edit_message_text(
@@ -459,6 +596,7 @@ async def safe_edit_search(bot, search, text):
             chat_id=search["chat_id"],
             message_id=search["message_id"],
             text=text,
+            reply_markup=None # убираем кнопки после завершения
         )
     except Exception as e:
         logger.debug("Не удалось изменить сообщение поиска: %s", e)
@@ -473,7 +611,9 @@ async def send_to_stick_game(bot, game, text, reply_markup=None):
             continue
         sent_chats.add(chat_id)
         try:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            # Если это последняя стадия игры, убираем кнопки
+            current_reply_markup = reply_markup if game["stage"] != "finished" else None
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=current_reply_markup)
         except Exception as e:
             logger.error("Не удалось отправить состояние Дуэли Клюшек в чат %s: %s", chat_id, e)
 
@@ -514,10 +654,17 @@ async def finish_stick_game_locked(bot, game):
     p1, p2 = game["players"]
     score1, score2 = game["score"]
 
+    winner_player = None
+    loser_player = None
+
     if score1 > score2:
         ending = f"🏆 Победитель: {p1['name']}!"
+        winner_player = p1
+        loser_player = p2
     elif score2 > score1:
         ending = f"🏆 Победитель: {p2['name']}!"
+        winner_player = p2
+        loser_player = p1
     else:
         ending = "🤝 Ничья!"
 
@@ -526,8 +673,20 @@ async def finish_stick_game_locked(bot, game):
         f"Итоговый счёт: {p1['name']} {score1}:{score2} {p2['name']}\n"
         f"{ending}"
     )
-    game["stage"] = "finished"
+    game["stage"] = "finished" # Устанавливаем стадию завершения для send_to_stick_game
     await send_to_stick_game(bot, game, text)
+
+    # Обновление MMR
+    if winner_player and loser_player:
+        update_stick_duel_mmr_stats(winner_player, loser_player)
+        # Добавляем информацию об изменении MMR в финальное сообщение
+        winner_mmr_info = get_mmr_user(winner_player['id'], winner_player.get('username'), winner_player['name'])
+        loser_mmr_info = get_mmr_user(loser_player['id'], loser_player.get('username'), loser_player['name'])
+        mmr_text = f"\n\n📊 MMR обновлен:\n" \
+                   f"{winner_player['name']}: {winner_mmr_info['mmr']} (сыграно: {winner_mmr_info['games_played']})\n" \
+                   f"{loser_player['name']}: {loser_mmr_info['mmr']} (сыграно: {loser_mmr_info['games_played']})"
+        await send_to_stick_game(bot, game, mmr_text)
+
 
     for player in game["players"]:
         if not player["is_bot"]:
@@ -632,7 +791,7 @@ async def stick_search_timeout(application, owner_id):
                 application.bot,
                 player,
                 stick_ai_player(),
-                [],
+                [search],
             )
     except asyncio.CancelledError:
         return
@@ -838,6 +997,31 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Неизвестное действие.", show_alert=True)
 
 
+async def mymmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    mmr_info = get_mmr_user(user.id, user.username, user.first_name)
+    await update.message.reply_text(
+        f"📊 Твой MMR в Дуэли Клюшек: {mmr_info['mmr']}\n"
+        f"Сыграно матчей: {mmr_info['games_played']}"
+    )
+
+
+async def ratingmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    top = get_top_mmr_rating()
+    if not top:
+        await update.message.reply_text("📊 Рейтинг MMR Дуэли Клюшек пуст. Нужно сыграть хотя бы 1 матч.")
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    text = "🏆 **ТОП-10 ИГРОКОВ RPL (MMR Дуэли Клюшек)**\n\n"
+    for i, row in enumerate(top):
+        first_name, username, mmr, games_played = row
+        user_label = f"(@{username})" if username else ""
+        text += f"{medals[i]} {first_name}{user_label}: {mmr} MMR ({games_played} матчей)\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 # ---------- Админ-панель ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -882,10 +1066,8 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Настройки":
         await show_settings(update, context)
     elif text == "🎮 Настройки игры":
-        await show_game_settings(update, context)
-    elif text == "🧹 Обнулить рейтинг":
-        reset_all_ratings()
-        await update.message.reply_text("♻️ Весь рейтинг игроков был успешно обнулен!")
+        await update.message.reply_text("⚙️ Выберите настройки для игры:", reply_markup=game_settings_main_keyboard())
+        return WAITING_GAME_SETTINGS
     elif text == "🚪 Выйти":
         remove_admin(user_id)
         await update.message.reply_text("🚪 Вышли", reply_markup=main_menu_keyboard())
@@ -946,39 +1128,85 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sources = get_source_channels()
     targets = get_target_chats()
     text = (
-        "📋 Настройки:\n\n📢 Источники:\n"
-        + "\n".join([f"- {s[1]}" for s in sources])
-        + "\n\n📥 Чаты:\n"
-        + "\n".join([f"- {t[1]}" for t in targets])
+        "📋 Настройки:\\n\\n📢 Источники:\\n"
+        + "\\n".join([f"- {s[1]}" for s in sources])
+        + "\\n\\n📥 Чаты:\\n"
+        + "\\n".join([f"- {t[1]}" for t in targets])
     )
     await update.message.reply_text(text, reply_markup=admin_menu_keyboard())
 
 
-async def show_game_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    g, s = get_config('gif_goal'), get_config('gif_save')
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Изменить GOAL", callback_data="set_goal"),
-        InlineKeyboardButton("🔄 Изменить SAVE", callback_data="set_save"),
-    ]])
-    await update.message.reply_text(f"🎮 Настройки GIF:\n\nGOAL: {g}\nSAVE: {s}", reply_markup=kb)
+async def show_bullet_duel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    gifs_goal = [get_config(f'gif_goal_{i}') for i in range(1, 4)]
+    gifs_save = [get_config(f'gif_save_{i}') for i in range(1, 4)]
+
+    text = "🎮 Настройки GIF для Дуэли Буллитов:\n\n"
+    text += "GOAL GIFs:\n"
+    for i, gif_id in enumerate(gifs_goal):
+        text += f"  {i+1}: {'Задана' if gif_id else 'Не задана'}\n"
+    text += "\nSAVE GIFs:\n"
+    for i, gif_id in enumerate(gifs_save):
+        text += f"  {i+1}: {'Задана' if gif_id else 'Не задана'}\n"
+
+    await query.edit_message_text(text, reply_markup=bullet_duel_settings_keyboard())
+    return WAITING_GIF_UPLOAD # Переводим в состояние ожидания GIF
+
+
+async def show_stick_duel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎮 Настройки Дуэли Клюшек:", reply_markup=stick_duel_settings_keyboard())
+    return ConversationHandler.END
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data in ["set_goal", "set_save"]:
-        context.user_data["gif_type"] = "gif_goal" if query.data == "set_goal" else "gif_save"
+    data = query.data
+
+    if data == "game_settings_bullet":
+        await show_bullet_duel_settings(update, context)
+        return WAITING_GIF_UPLOAD # остаёмся в этом хэндлере, но переходим в sub-меню
+    elif data == "game_settings_stick":
+        await show_stick_duel_settings(update, context)
+        return ConversationHandler.END # Просто показываем меню и завершаем текущий ConversationHandler
+    elif data == "game_settings_back":
+        await query.edit_message_text("⚙️ Выберите настройки для игры:", reply_markup=game_settings_main_keyboard())
+        return WAITING_GAME_SETTINGS
+    elif data == "admin_back_to_main":
+        await query.edit_message_text("✅ Вы в админ-панели", reply_markup=admin_menu_keyboard())
+        return ConversationHandler.END
+    elif data.startswith("set_gif_"):
+        context.user_data["gif_type_key"] = data.replace("set_gif_", "gif_") # e.g., "gif_goal_1"
         await query.edit_message_text("📤 Отправьте GIF:")
         return WAITING_GIF_UPLOAD
+    elif data == "reset_bullet_rating":
+        reset_bullet_duel_ratings()
+        await query.edit_message_text("♻️ Рейтинг «Дуэли Буллитов» был успешно обнулен!", reply_markup=bullet_duel_settings_keyboard())
+        return WAITING_GIF_UPLOAD
+    elif data == "reset_stick_mmr_rating":
+        reset_stick_duel_mmr_ratings()
+        await query.edit_message_text("♻️ Рейтинг MMR «Дуэли Клюшек» был успешно обнулен!", reply_markup=stick_duel_settings_keyboard())
+        return ConversationHandler.END
     return ConversationHandler.END
 
 
 async def receive_gif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = update.message.animation.file_id if update.message.animation else None
     if file_id:
-        set_config(context.user_data.get("gif_type"), file_id)
-        await update.message.reply_text("✅ Сохранено")
-        return ConversationHandler.END
+        key_to_set = context.user_data.get("gif_type_key")
+        if key_to_set:
+            set_config(key_to_set, file_id)
+            await update.message.reply_text("✅ Сохранено")
+            await show_bullet_duel_settings(update, context) # Возвращаемся в меню настроек буллитов
+            return WAITING_GIF_UPLOAD
+        else:
+            await update.message.reply_text("❌ Ошибка: не удалось определить тип GIF для сохранения.")
+            return WAITING_GIF_UPLOAD
+    await update.message.reply_text("❌ Вы отправили не GIF. Попробуйте еще раз или /cancel.")
     return WAITING_GIF_UPLOAD
 
 
@@ -1006,8 +1234,10 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("regrpl", "Дуэль Клюшек — найти соперника"),
+        BotCommand("mymmr", "Мой MMR в Дуэли Клюшек"),
+        BotCommand("ratingmmr", "Топ-10 MMR игроков в Дуэли Клюшек"),
         BotCommand("duelrpl", "Дуэль Буллитов с ИИ-вратарём"),
-        BotCommand("rating", "Топ-10 игроков лиги"),
+        BotCommand("rating", "Топ-10 игроков лиги (Дуэль Буллитов)"),
     ], scope=BotCommandScopeDefault())
 
 
@@ -1017,6 +1247,8 @@ def main():
 
     # Новая глобальная «Дуэль Клюшек»
     app.add_handler(CommandHandler("regrpl", regrpl_command))
+    app.add_handler(CommandHandler("mymmr", mymmr_command))
+    app.add_handler(CommandHandler("ratingmmr", ratingmmr_command))
     app.add_handler(CallbackQueryHandler(stick_duel_callback, pattern=r"^rpl_"))
 
     # Старая система одиночной дуэли
@@ -1042,11 +1274,23 @@ def main():
         allow_reentry=True,
     ))
 
-    # Админка — GIF
+    # Админка — НАСТРОЙКИ ИГР (GIF + обнуление рейтингов)
     app.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^set_")],
+        entry_points=[
+            MessageHandler(filters.Regex("^🎮 Настройки игры$"), admin_buttons),
+            CallbackQueryHandler(admin_callback, pattern="^game_settings_"),
+            CallbackQueryHandler(admin_callback, pattern="^set_gif_"),
+            CallbackQueryHandler(admin_callback, pattern="^reset_bullet_rating$"),
+            CallbackQueryHandler(admin_callback, pattern="^reset_stick_mmr_rating$"),
+            CallbackQueryHandler(admin_callback, pattern="^admin_back_to_main$"),
+        ],
         states={
-            WAITING_GIF_UPLOAD: [MessageHandler(filters.ANIMATION | filters.Document.ALL, receive_gif)],
+            WAITING_GAME_SETTINGS: [CallbackQueryHandler(admin_callback, pattern="^game_settings_")],
+            WAITING_GIF_UPLOAD: [
+                MessageHandler(filters.ANIMATION | filters.Document.ALL, receive_gif),
+                CallbackQueryHandler(admin_callback, pattern="^game_settings_bullet$|^game_settings_back$|^reset_bullet_rating$"),
+                CommandHandler("cancel", adminkarpl) # для выхода из меню настроек GIF
+            ],
         },
         fallbacks=[CommandHandler("cancel", adminkarpl)],
         allow_reentry=True,
@@ -1078,12 +1322,9 @@ def main():
     ))
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rating", rating_command))
     app.add_handler(MessageHandler(filters.Regex("^🏠 Главное меню$"), main_menu))
     app.add_handler(MessageHandler(filters.Regex("^📩 Проверить поддержку$"), admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Настройки$"), admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🎮 Настройки игры$"), admin_buttons))
-    app.add_handler(MessageHandler(filters.Regex("^🧹 Обнулить рейтинг$"), admin_buttons))
     app.add_handler(MessageHandler(filters.Regex("^🚪 Выйти$"), admin_buttons))
     app.add_handler(CallbackQueryHandler(inline_callback, pattern="^(discord|website)$"))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, forward_from_channels))
