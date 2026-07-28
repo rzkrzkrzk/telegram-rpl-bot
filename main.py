@@ -362,12 +362,6 @@ def update_mmr(user_id, username, first_name, mmr_change):
 
 
 def calculate_mmr_delta(winner_mmr, loser_mmr):
-    """
-    Динамический разброс MMR:
-    При ~1000 MMR: +15 / -15
-    Чем меньше MMR у победителя (например 900), тем больше плюс (+20 / -10)
-    Чем больше MMR у победителя (например 1100), тем меньше плюс (+10 / -20)
-    """
     win_delta = round(15 + (1000 - winner_mmr) / 20)
     winner_gain = max(5, min(35, win_delta))
 
@@ -534,7 +528,6 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✍️ Напишите сообщение поддержке или /cancel")
         return WAITING_SUPPORT_MSG
     elif data == "duel":
-        # Проверка кулдауна 5 минут
         user = query.from_user
         can_play, remaining = check_bullet_cooldown(user.id)
         if not can_play:
@@ -546,23 +539,20 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🏒 Дуэль Буллитов! Выбери зону для броска:", reply_markup=duel_shot_keyboard())
         return WAITING_DUEL_SHOT
     elif data == "stick_duel":
-        # Запуск Дуэли Клюшек с главной страницы
         await regrpl_command(update, context)
     elif data == "profile":
         await profile_command(update, context)
 
 
-# ---------- Профиль пользователя ----------
+# ---------- Профиль пользователя (ОБНОВЛЕНО) ----------
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Данные Буллитов
     c.execute('SELECT goals, total_shots FROM duel_stats WHERE user_id = ?', (user.id,))
     bullet_row = c.fetchone()
 
-    # Данные MMR
     c.execute('SELECT mmr, games_played FROM mmr_stats WHERE user_id = ?', (user.id,))
     mmr_row = c.fetchone()
     conn.close()
@@ -570,18 +560,17 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👤 **ПРОФИЛЬ ИГРОКА**", f"Ник: {user.first_name}" + (f" (@{user.username})" if user.username else "")]
     lines.append(f"🆔 ID: `{user.id}`")
 
-    # Показываем рейтинг Буллитов только если сыграно >= 7 бросков
+    # Пункт 1: % забитых голов (если менее 7 бросков - не показывает)
     if bullet_row and bullet_row[1] >= 7:
         goals, total = bullet_row
         percent = (goals / total) * 100
         lines.append(f"🏒 **Дуэль Буллитов:** {percent:.1f}% забитых ({goals}/{total})")
 
-    # Показываем MMR только если сыгран хотя бы 1 матч
+    # Пункт 2: MMR в Дуэли клюшек (если не играл - не показывает)
     if mmr_row and mmr_row[1] > 0:
         mmr_val, g_played = mmr_row
         lines.append(f"⚔️ **Дуэль Клюшек (MMR):** {mmr_val} ({g_played} игр)")
 
-        # Звание в зависимости от MMR
         if mmr_val >= 1200:
             rank = "🏆 Легенда RPL"
         elif mmr_val >= 1050:
@@ -592,7 +581,6 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rank = "🐣 Новичок"
         lines.append(f"🎖 **Звание:** {rank}")
 
-    # Статус кулдауна Буллитов
     can_play, remaining = check_bullet_cooldown(user.id)
     if can_play:
         lines.append("⏱ **Дуэль Буллитов:** Готова к игре!")
@@ -687,7 +675,7 @@ async def duel_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Новая мини-игра «Дуэль Клюшек» ----------
+# ---------- Новая мини-игра «Дуэль Клюшек» (С задержкой 5 сек на удаление) ----------
 def stick_player(user, chat_id):
     return {
         "id": user.id,
@@ -715,12 +703,15 @@ def cancel_search_task(search):
 
 
 async def safe_delete_and_send(bot, chat_id, old_msg_id, text, reply_markup=None):
-    """Удаляет старое сообщение и отправляет новое для предотвращения спама."""
+    """Удаляет старое сообщение через 5 секунд и отправляет новое."""
     if old_msg_id:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
-        except Exception as e:
-            logger.debug("Не удалось удалить старое сообщение %s в %s: %s", old_msg_id, chat_id, e)
+        async def delayed_delete():
+            await asyncio.sleep(5)
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+            except Exception as e:
+                logger.debug("Не удалось удалить старое сообщение %s в %s: %s", old_msg_id, chat_id, e)
+        asyncio.create_task(delayed_delete())
 
     try:
         new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
@@ -731,7 +722,6 @@ async def safe_delete_and_send(bot, chat_id, old_msg_id, text, reply_markup=None
 
 
 async def send_to_stick_game(bot, game, text, reply_markup=None):
-    """Удаляет предыдущее сообщение игры и отправляет свежее каждому участнику."""
     if "chat_msg_ids" not in game:
         game["chat_msg_ids"] = {}
 
@@ -750,17 +740,18 @@ async def send_to_stick_game(bot, game, text, reply_markup=None):
 
 
 async def begin_stick_game_locked(bot, first_player, second_player, searches):
-    """Создаёт игру. Вызывается только внутри stick_duel_lock."""
     for search in searches:
         cancel_search_task(search)
-        # Удаляем сообщение поиска
         old_id = search.get("message_id")
         chat_id = search.get("chat_id")
         if old_id and chat_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=old_id)
-            except Exception:
-                pass
+            async def delayed_search_delete():
+                await asyncio.sleep(5)
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=old_id)
+                except Exception:
+                    pass
+            asyncio.create_task(delayed_search_delete())
 
     game_id = uuid.uuid4().hex[:12]
     game = {
@@ -889,7 +880,6 @@ async def send_stick_turn_locked(bot, game):
     )
 
     if attacker["is_bot"]:
-        # Бот выбирает направление броска
         game["shot"] = random.choice(list(SHOT_LABELS.keys()))
         game["stage"] = "save"
         await send_to_stick_game(
@@ -952,7 +942,6 @@ async def regrpl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(msg)
             return
 
-        # Поиск опоннента среди реальных игроков
         opponent_id = next((uid for uid in stick_duel_searches if uid != user.id), None)
         if opponent_id is not None:
             opponent_search = stick_duel_searches.pop(opponent_id)
@@ -997,7 +986,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = query.from_user
 
     async with stick_duel_lock:
-        # Принять поиск
         if data.startswith("rpl_accept:"):
             try:
                 owner_id = int(data.split(":", 1)[1])
@@ -1034,7 +1022,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        # Играть с ИИ
         if data.startswith("rpl_ai:"):
             try:
                 owner_id = int(data.split(":", 1)[1])
@@ -1061,7 +1048,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        # Отменить поиск
         if data.startswith("rpl_cancel:"):
             try:
                 owner_id = int(data.split(":", 1)[1])
@@ -1080,14 +1066,18 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             await query.answer("Отменено!")
             cancel_search_task(search)
-            try:
-                await context.bot.delete_message(chat_id=search["chat_id"], message_id=search["message_id"])
-            except Exception:
-                pass
+            
+            async def delayed_cancel_delete():
+                await asyncio.sleep(5)
+                try:
+                    await context.bot.delete_message(chat_id=search["chat_id"], message_id=search["message_id"])
+                except Exception:
+                    pass
+            asyncio.create_task(delayed_cancel_delete())
+
             await context.bot.send_message(chat_id=search["chat_id"], text="❌ Поиск соперника отменён.")
             return
 
-        # Игровые действия
         parts = data.split(":")
         if len(parts) != 4 or parts[0] not in ("rpl_shot", "rpl_save"):
             await query.answer("Некорректное действие.", show_alert=True)
@@ -1114,7 +1104,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         attacker = game["players"][attacker_index]
         goalie = game["players"][goalie_index]
 
-        # Нападающий выбирает куда бросить
         if action == "rpl_shot":
             if game["stage"] != "shot":
                 await query.answer("Сейчас не этап броска.", show_alert=True)
@@ -1137,7 +1126,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             if goalie["is_bot"]:
-                # Сложный ИИ-вратарь: 80% вероятность угадать сейв
                 await send_to_stick_game(context.bot, game, header)
 
                 if random.random() < 0.8:
@@ -1155,7 +1143,6 @@ async def stick_duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             return
 
-        # Вратарь выбирает как отбить
         if action == "rpl_save":
             if game["stage"] != "save":
                 await query.answer("Сейчас не этап сейва.", show_alert=True)
@@ -1198,30 +1185,35 @@ async def ratingmmr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ---------- Админ-панель ----------
+# ---------- Админ-панель (ИСПРАВЛЕН ВХОД) ----------
 async def adminkarpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return ConversationHandler.END
     if is_admin(update.effective_user.id):
-        await update.message.reply_text("✅ Вы в админ-панели", reply_markup=admin_menu_keyboard())
+        await update.message.reply_text("✅ Вы уже в админ-панели", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("🔑 Введите логин:")
     return WAITING_LOGIN
 
 
 async def wait_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["login"] = update.message.text
+    context.user_data["admin_login"] = update.message.text.strip()
     await update.message.reply_text("🔒 Введите пароль:")
     return WAITING_PASSWORD
 
 
 async def wait_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if check_credentials(context.user_data.get("login"), update.message.text):
+    login = context.user_data.pop("admin_login", None)
+    password = update.message.text.strip()
+    
+    if login and check_credentials(login, password):
         add_admin(update.effective_user.id)
         await update.message.reply_text("✅ Авторизован!", reply_markup=admin_menu_keyboard())
         return ConversationHandler.END
-    await update.message.reply_text("❌ Ошибка!")
-    return WAITING_PASSWORD
+    else:
+        await update.message.reply_text("❌ Неверный логин или пароль. Попробуйте снова /adminkarpl")
+        return ConversationHandler.END
 
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1479,12 +1471,12 @@ def main():
         allow_reentry=True,
     ))
 
-    # Авторизация администратора
+    # Авторизация администратора (ИСПРАВЛЕНА)
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("adminkarpl", adminkarpl)],
         states={
-            WAITING_LOGIN: [MessageHandler(filters.TEXT, wait_login)],
-            WAITING_PASSWORD: [MessageHandler(filters.TEXT, wait_password)],
+            WAITING_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_login)],
+            WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wait_password)],
         },
         fallbacks=[CommandHandler("cancel", start)],
         allow_reentry=True,
